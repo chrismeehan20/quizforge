@@ -365,7 +365,8 @@ export default function QuizForge() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingProgress, setProcessingProgress] = useState(0);
   const [processingStatus, setProcessingStatus] = useState('');
-  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [extractedContents, setExtractedContents] = useState([]); // { file, text, images, fileType }
   const [textInput, setTextInput] = useState('');
   const [showTextInput, setShowTextInput] = useState(false);
   const [apiKey, setApiKey] = useState('');
@@ -427,65 +428,124 @@ export default function QuizForge() {
     e.preventDefault();
     const files = e.dataTransfer?.files;
     if (files?.length > 0) {
-      handleFileSelect(files[0]);
+      handleFilesSelect(Array.from(files));
     }
   }, []);
 
-  const handleFileSelect = async (file) => {
-    if (!file) {
-      setUploadedFile(null);
-      setExtractedImages([]);
-      setExtractedText('');
-      setFileType(null);
+  const handleFilesSelect = async (newFiles) => {
+    if (!newFiles || newFiles.length === 0) return;
+
+    // Filter valid files
+    const validFiles = newFiles.filter(file => {
+      const name = file.name.toLowerCase();
+      return name.endsWith('.pdf') || name.endsWith('.docx') ||
+             name.endsWith('.txt') || file.type === 'application/pdf' ||
+             file.type === 'text/plain';
+    });
+
+    if (validFiles.length === 0) {
+      setError('Please upload PDF, Word (.docx), or text files.');
       return;
     }
-    
-    const fileName = file.name.toLowerCase();
-    const isPdf = fileName.endsWith('.pdf') || file.type === 'application/pdf';
-    const isDocx = fileName.endsWith('.docx') || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-    const isTxt = fileName.endsWith('.txt') || file.type === 'text/plain';
-    
-    if (!isPdf && !isDocx && !isTxt) {
-      setError('Please upload a PDF, Word document (.docx), or text file.');
+
+    // Add to existing files (no duplicates by name)
+    const existingNames = uploadedFiles.map(f => f.name);
+    const uniqueNewFiles = validFiles.filter(f => !existingNames.includes(f.name));
+
+    if (uniqueNewFiles.length === 0) {
+      setError('These files have already been added.');
       return;
     }
-    
-    setUploadedFile(file);
+
+    const allFiles = [...uploadedFiles, ...uniqueNewFiles];
+    setUploadedFiles(allFiles);
     setError(null);
-    setExtractedImages([]);
-    setExtractedText('');
-    setFileType(isPdf ? 'pdf' : isDocx ? 'docx' : 'txt');
-    
+
+    // Extract content from new files
+    setProcessingStatus(`Extracting content from ${uniqueNewFiles.length} file(s)...`);
+
     try {
-      if (isTxt) {
-        const text = await file.text();
-        setTextInput(text);
-        setExtractedText(text);
-      } else if (isDocx) {
-        setProcessingStatus('Extracting content from Word document...');
-        const [text, images] = await Promise.all([
-          extractTextFromDocx(file),
-          extractImagesFromDocx(file)
-        ]);
-        setExtractedText(text);
-        setTextInput(text);
-        setExtractedImages(images);
-      } else if (isPdf) {
-        setProcessingStatus('Extracting text from PDF...');
-        const text = await extractTextFromPdf(file);
-        setExtractedText(text);
-        setTextInput(text);
-        
-        // Check if PDF might be scanned
-        if (text.length < 100) {
-          setError('Warning: This PDF appears to have very little text. It may be a scanned document. For best results, use a text-based PDF.');
+      const newContents = await Promise.all(uniqueNewFiles.map(async (file) => {
+        const fileName = file.name.toLowerCase();
+        const fileType = fileName.endsWith('.pdf') ? 'pdf' :
+                         fileName.endsWith('.docx') ? 'docx' : 'txt';
+
+        let text = '';
+        let images = [];
+
+        if (fileType === 'txt') {
+          text = await file.text();
+        } else if (fileType === 'docx') {
+          [text, images] = await Promise.all([
+            extractTextFromDocx(file),
+            extractImagesFromDocx(file)
+          ]);
+        } else if (fileType === 'pdf') {
+          text = await extractTextFromPdf(file);
         }
+
+        return { file, text, images, fileType };
+      }));
+
+      // Update extracted contents
+      const updatedContents = [...extractedContents, ...newContents];
+      setExtractedContents(updatedContents);
+
+      // Concatenate all text
+      const combinedText = updatedContents.map(c =>
+        `--- ${c.file.name} ---\n${c.text}`
+      ).join('\n\n');
+      setExtractedText(combinedText);
+      setTextInput(combinedText);
+
+      // Combine all images
+      const allImages = updatedContents.flatMap(c => c.images);
+      setExtractedImages(allImages);
+
+      // Set file type based on first file (for display purposes)
+      if (updatedContents.length > 0) {
+        setFileType(updatedContents[0].fileType);
       }
+
       setProcessingStatus('');
     } catch (err) {
-      setError(err.message || 'Failed to process file.');
+      setError(err.message || 'Failed to process files.');
       setProcessingStatus('');
     }
+  };
+
+  const removeFile = (fileName) => {
+    setUploadedFiles(prev => prev.filter(f => f.name !== fileName));
+    setExtractedContents(prev => {
+      const updated = prev.filter(c => c.file.name !== fileName);
+
+      // Recalculate combined text
+      if (updated.length > 0) {
+        const combinedText = updated.map(c =>
+          `--- ${c.file.name} ---\n${c.text}`
+        ).join('\n\n');
+        setExtractedText(combinedText);
+        setTextInput(combinedText);
+        setExtractedImages(updated.flatMap(c => c.images));
+        setFileType(updated[0].fileType);
+      } else {
+        setExtractedText('');
+        setTextInput('');
+        setExtractedImages([]);
+        setFileType(null);
+      }
+
+      return updated;
+    });
+  };
+
+  const clearAllFiles = () => {
+    setUploadedFiles([]);
+    setExtractedContents([]);
+    setExtractedText('');
+    setTextInput('');
+    setExtractedImages([]);
+    setFileType(null);
   };
 
   const processQuiz = async (content) => {
@@ -1446,7 +1506,8 @@ ${resourceRefs}
     setCurrentStep(0);
     setQuiz(null);
     setSelectedQuestionIndex(0);
-    setUploadedFile(null);
+    setUploadedFiles([]);
+    setExtractedContents([]);
     setTextInput('');
     setExtractedText('');
     setError(null);
@@ -1565,7 +1626,7 @@ ${resourceRefs}
       <main style={styles.main}>
         {currentStep === 0 && mode === 'parse' && (
           <UploadStep
-            uploadedFile={uploadedFile}
+            uploadedFiles={uploadedFiles}
             textInput={textInput}
             showTextInput={showTextInput}
             fileInputRef={fileInputRef}
@@ -1576,7 +1637,9 @@ ${resourceRefs}
             fileType={fileType}
             processingStatus={processingStatus}
             onDrop={handleDrop}
-            onFileSelect={handleFileSelect}
+            onFilesSelect={handleFilesSelect}
+            onRemoveFile={removeFile}
+            onClearAllFiles={clearAllFiles}
             onTextChange={setTextInput}
             onToggleTextInput={() => setShowTextInput(!showTextInput)}
             onStartProcessing={handleStartProcessing}
@@ -1586,7 +1649,7 @@ ${resourceRefs}
 
         {currentStep === 0 && mode === 'generate' && (
           <GenerateUploadStep
-            uploadedFile={uploadedFile}
+            uploadedFiles={uploadedFiles}
             fileInputRef={fileInputRef}
             error={error}
             apiKey={apiKey}
@@ -1596,7 +1659,9 @@ ${resourceRefs}
             generationConfig={generationConfig}
             pageRange={pageRange}
             onDrop={handleDrop}
-            onFileSelect={handleFileSelect}
+            onFilesSelect={handleFilesSelect}
+            onRemoveFile={removeFile}
+            onClearAllFiles={clearAllFiles}
             onConfigChange={setGenerationConfig}
             onPageRangeChange={setPageRange}
             onGenerate={handleGenerateQuiz}
@@ -1682,17 +1747,18 @@ ${resourceRefs}
 // UPLOAD STEP
 // ============================================================================
 
-function UploadStep({ 
-  uploadedFile, textInput, showTextInput, fileInputRef, error, apiKey,
+function UploadStep({
+  uploadedFiles, textInput, showTextInput, fileInputRef, error, apiKey,
   extractedImages, extractedText, fileType, processingStatus,
-  onDrop, onFileSelect, onTextChange, onToggleTextInput, onStartProcessing, onLoadSample,
+  onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onTextChange, onToggleTextInput, onStartProcessing, onLoadSample,
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
-  const getFileTypeIcon = () => {
-    if (fileType === 'pdf') return <FileType size={32} color="#ef4444" />;
-    if (fileType === 'docx') return <FileText size={32} color="#3b82f6" />;
-    return <FileText size={32} color="#64748b" />;
+  const getFileTypeIconForFile = (file) => {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.pdf')) return <FileType size={20} color="#ef4444" />;
+    if (name.endsWith('.docx')) return <FileText size={20} color="#3b82f6" />;
+    return <FileText size={20} color="#64748b" />;
   };
 
   return (
@@ -1713,49 +1779,77 @@ function UploadStep({
 
       <div style={styles.uploadContainer}>
         <div
-          style={{ ...styles.dropZone, ...(isDragging && styles.dropZoneDragging), ...(uploadedFile && styles.dropZoneWithFile) }}
+          style={{ ...styles.dropZone, ...(isDragging && styles.dropZoneDragging), ...(uploadedFiles.length > 0 && styles.dropZoneWithFile) }}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={() => setIsDragging(false)}
           onDrop={(e) => { setIsDragging(false); onDrop(e); }}
-          onClick={() => !uploadedFile && fileInputRef.current?.click()}
+          onClick={() => uploadedFiles.length === 0 && fileInputRef.current?.click()}
         >
           <input
             ref={fileInputRef}
             type="file"
             accept=".pdf,.doc,.docx,.txt"
+            multiple
             style={{ display: 'none' }}
-            onChange={(e) => e.target.files?.[0] && onFileSelect(e.target.files[0])}
+            onChange={(e) => {
+              const files = Array.from(e.target.files || []);
+              if (files.length > 0) onFilesSelect(files);
+              e.target.value = '';
+            }}
           />
-          
-          {uploadedFile ? (
+
+          {uploadedFiles.length > 0 ? (
             <div style={styles.filePreviewContainer}>
-              <div style={styles.filePreview}>
-                <div style={styles.fileIcon}>{getFileTypeIcon()}</div>
-                <div style={styles.fileInfo}>
-                  <span style={styles.fileName}>{uploadedFile.name}</span>
-                  <span style={styles.fileSize}>
-                    {(uploadedFile.size / 1024).toFixed(1)} KB • {fileType?.toUpperCase()}
-                  </span>
+              <div style={styles.fileListHeader}>
+                <span style={styles.fileListTitle}>{uploadedFiles.length} file(s) selected</span>
+                <div style={styles.fileListActions}>
+                  <button
+                    style={styles.addMoreButton}
+                    onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                  >
+                    <Plus size={16} /> Add more
+                  </button>
+                  <button
+                    style={styles.clearAllButton}
+                    onClick={(e) => { e.stopPropagation(); onClearAllFiles(); }}
+                  >
+                    <X size={16} /> Clear all
+                  </button>
                 </div>
-                <button style={styles.removeFileButton} onClick={(e) => { e.stopPropagation(); onFileSelect(null); }}>
-                  <X size={18} />
-                </button>
               </div>
-              
+
+              <div style={styles.fileList}>
+                {uploadedFiles.map((file) => (
+                  <div key={file.name} style={styles.fileListItem}>
+                    <div style={styles.fileListItemIcon}>{getFileTypeIconForFile(file)}</div>
+                    <div style={styles.fileListItemInfo}>
+                      <span style={styles.fileListItemName}>{file.name}</span>
+                      <span style={styles.fileListItemSize}>{(file.size / 1024).toFixed(1)} KB</span>
+                    </div>
+                    <button
+                      style={styles.fileListItemRemove}
+                      onClick={(e) => { e.stopPropagation(); onRemoveFile(file.name); }}
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
               {processingStatus && (
                 <div style={styles.processingIndicator}>
                   <Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} />
                   <span>{processingStatus}</span>
                 </div>
               )}
-              
+
               {extractedText && !processingStatus && (
                 <div style={styles.extractedTextPreview}>
                   <CheckCircle2 size={16} color="#10b981" />
-                  <span>{extractedText.length.toLocaleString()} characters extracted</span>
+                  <span>{extractedText.length.toLocaleString()} total characters extracted</span>
                 </div>
               )}
-              
+
               {extractedImages.length > 0 && (
                 <div style={styles.extractedImagesPreview}>
                   <div style={styles.extractedImagesHeader}>
@@ -1779,7 +1873,7 @@ function UploadStep({
             <>
               <div style={styles.uploadIcon}><Upload size={40} strokeWidth={1.5} /></div>
               <p style={styles.dropText}>
-                <span style={styles.dropTextBold}>Drop your quiz file here</span><br />or click to browse
+                <span style={styles.dropTextBold}>Drop your quiz files here</span><br />or click to browse (multiple files supported)
               </p>
               <div style={styles.supportedFormatsRow}>
                 <span style={styles.formatBadge}><FileType size={14} /> PDF</span>
@@ -1820,9 +1914,9 @@ Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
 
       <div style={styles.processButtonContainer}>
         <button
-          style={{ ...styles.processButton, opacity: (!uploadedFile && !textInput.trim()) ? 0.6 : 1 }}
+          style={{ ...styles.processButton, opacity: (uploadedFiles.length === 0 && !textInput.trim()) ? 0.6 : 1 }}
           onClick={onStartProcessing}
-          disabled={(!uploadedFile && !textInput.trim()) || !!processingStatus}
+          disabled={(uploadedFiles.length === 0 && !textInput.trim()) || !!processingStatus}
         >
           <Wand2 size={20} />
           <span>Process Quiz with AI</span>
@@ -1862,9 +1956,9 @@ Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
 // ============================================================================
 
 function GenerateUploadStep({
-  uploadedFile, fileInputRef, error, apiKey, extractedText, fileType, processingStatus,
+  uploadedFiles, fileInputRef, error, apiKey, extractedText, fileType, processingStatus,
   generationConfig, pageRange,
-  onDrop, onFileSelect, onConfigChange, onPageRangeChange, onGenerate
+  onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onConfigChange, onPageRangeChange, onGenerate
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -1897,10 +1991,11 @@ function GenerateUploadStep({
     onConfigChange({ ...generationConfig, bloomsLevels: updated });
   };
 
-  const getFileTypeIcon = () => {
-    if (fileType === 'pdf') return <FileType size={32} color="#ef4444" />;
-    if (fileType === 'docx') return <FileText size={32} color="#3b82f6" />;
-    return <FileText size={32} color="#64748b" />;
+  const getFileTypeIconForFile = (file) => {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.pdf')) return <FileType size={20} color="#ef4444" />;
+    if (name.endsWith('.docx')) return <FileText size={20} color="#3b82f6" />;
+    return <FileText size={20} color="#64748b" />;
   };
 
   return (
@@ -1928,33 +2023,61 @@ function GenerateUploadStep({
           </h2>
 
           <div
-            style={{ ...styles.dropZone, ...(isDragging && styles.dropZoneDragging), ...(uploadedFile && styles.dropZoneWithFile) }}
+            style={{ ...styles.dropZone, ...(isDragging && styles.dropZoneDragging), ...(uploadedFiles.length > 0 && styles.dropZoneWithFile) }}
             onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
             onDragLeave={() => setIsDragging(false)}
             onDrop={(e) => { setIsDragging(false); onDrop(e); }}
-            onClick={() => !uploadedFile && fileInputRef.current?.click()}
+            onClick={() => uploadedFiles.length === 0 && fileInputRef.current?.click()}
           >
             <input
               ref={fileInputRef}
               type="file"
               accept=".pdf,.doc,.docx,.txt"
+              multiple
               style={{ display: 'none' }}
-              onChange={(e) => e.target.files?.[0] && onFileSelect(e.target.files[0])}
+              onChange={(e) => {
+                const files = Array.from(e.target.files || []);
+                if (files.length > 0) onFilesSelect(files);
+                e.target.value = '';
+              }}
             />
 
-            {uploadedFile ? (
+            {uploadedFiles.length > 0 ? (
               <div style={styles.filePreviewContainer}>
-                <div style={styles.filePreview}>
-                  <div style={styles.fileIcon}>{getFileTypeIcon()}</div>
-                  <div style={styles.fileInfo}>
-                    <span style={styles.fileName}>{uploadedFile.name}</span>
-                    <span style={styles.fileSize}>
-                      {(uploadedFile.size / 1024).toFixed(1)} KB • {fileType?.toUpperCase()}
-                    </span>
+                <div style={styles.fileListHeader}>
+                  <span style={styles.fileListTitle}>{uploadedFiles.length} file(s) selected</span>
+                  <div style={styles.fileListActions}>
+                    <button
+                      style={styles.addMoreButton}
+                      onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                    >
+                      <Plus size={16} /> Add more
+                    </button>
+                    <button
+                      style={styles.clearAllButton}
+                      onClick={(e) => { e.stopPropagation(); onClearAllFiles(); }}
+                    >
+                      <X size={16} /> Clear all
+                    </button>
                   </div>
-                  <button style={styles.removeFileButton} onClick={(e) => { e.stopPropagation(); onFileSelect(null); }}>
-                    <X size={18} />
-                  </button>
+                </div>
+
+                <div style={styles.fileList}>
+                  {uploadedFiles.map((file) => (
+                    <div key={file.name} style={styles.fileListItem}>
+                      <div style={styles.fileListItemIcon}>{getFileTypeIconForFile(file)}</div>
+                      <div style={styles.fileListItemInfo}>
+                        <span style={styles.fileListItemName}>{file.name}</span>
+                        <span style={styles.fileListItemSize}>{(file.size / 1024).toFixed(1)} KB</span>
+                      </div>
+                      <button
+                        style={styles.fileListItemRemove}
+                        onClick={(e) => { e.stopPropagation(); onRemoveFile(file.name); }}
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
                 </div>
 
                 {processingStatus && (
@@ -1967,7 +2090,7 @@ function GenerateUploadStep({
                 {extractedText && !processingStatus && (
                   <div style={styles.extractedTextPreview}>
                     <CheckCircle2 size={16} color="#10b981" />
-                    <span>{extractedText.length.toLocaleString()} characters extracted</span>
+                    <span>{extractedText.length.toLocaleString()} total characters extracted</span>
                   </div>
                 )}
               </div>
@@ -1975,7 +2098,7 @@ function GenerateUploadStep({
               <>
                 <div style={styles.uploadIcon}><Upload size={40} strokeWidth={1.5} /></div>
                 <p style={styles.dropText}>
-                  <span style={styles.dropTextBold}>Drop your source material here</span><br />or click to browse
+                  <span style={styles.dropTextBold}>Drop your source material here</span><br />or click to browse (multiple files supported)
                 </p>
                 <div style={styles.supportedFormatsRow}>
                   <span style={styles.formatBadge}><FileType size={14} /> PDF</span>
@@ -2130,10 +2253,10 @@ function GenerateUploadStep({
         <button
           style={{
             ...styles.processButton,
-            opacity: (!uploadedFile || totalQuestions === 0 || processingStatus) ? 0.6 : 1
+            opacity: (uploadedFiles.length === 0 || totalQuestions === 0 || processingStatus) ? 0.6 : 1
           }}
           onClick={onGenerate}
-          disabled={!uploadedFile || totalQuestions === 0 || !!processingStatus}
+          disabled={uploadedFiles.length === 0 || totalQuestions === 0 || !!processingStatus}
         >
           <Sparkles size={20} />
           <span>Generate {totalQuestions} Questions</span>
@@ -2998,6 +3121,18 @@ const styles = {
   fileName: { display: 'block', fontSize: '15px', fontWeight: '600', color: '#1e293b' },
   fileSize: { fontSize: '13px', color: '#64748b' },
   removeFileButton: { width: '36px', height: '36px', borderRadius: '8px', border: 'none', backgroundColor: '#fef2f2', color: '#dc2626', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  fileListHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: '8px' },
+  fileListTitle: { fontSize: '14px', fontWeight: '600', color: '#374151' },
+  fileListActions: { display: 'flex', gap: '8px' },
+  addMoreButton: { display: 'flex', alignItems: 'center', gap: '4px', padding: '6px 12px', border: '1px solid #3b82f6', borderRadius: '6px', backgroundColor: '#eff6ff', color: '#3b82f6', fontSize: '12px', fontWeight: '500', cursor: 'pointer' },
+  clearAllButton: { display: 'flex', alignItems: 'center', gap: '4px', padding: '6px 12px', border: '1px solid #dc2626', borderRadius: '6px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '12px', fontWeight: '500', cursor: 'pointer' },
+  fileList: { display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto', width: '100%' },
+  fileListItem: { display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 12px', backgroundColor: '#f8fafc', borderRadius: '8px', border: '1px solid #e5e7eb' },
+  fileListItemIcon: { width: '36px', height: '36px', borderRadius: '8px', backgroundColor: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e5e7eb' },
+  fileListItemInfo: { flex: 1, minWidth: 0, textAlign: 'left' },
+  fileListItemName: { display: 'block', fontSize: '13px', fontWeight: '500', color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  fileListItemSize: { fontSize: '11px', color: '#64748b' },
+  fileListItemRemove: { width: '28px', height: '28px', borderRadius: '6px', border: 'none', backgroundColor: 'transparent', color: '#9ca3af', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' },
   processingIndicator: { display: 'flex', alignItems: 'center', gap: '8px', color: '#3b82f6', fontSize: '13px' },
   extractedTextPreview: { display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#10b981' },
   extractedImagesPreview: { borderTop: '1px solid #e5e7eb', paddingTop: '16px' },
