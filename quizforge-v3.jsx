@@ -2395,7 +2395,7 @@ ${resourceRefs}
           <div style={styles.headerActions}>
             <div style={styles.usageIndicator}>
               <Sparkles size={16} />
-              <span>AI: {rateLimitInfo.remaining}/{rateLimitInfo.limit} uses today</span>
+              <span>{rateLimitInfo.remaining}/{rateLimitInfo.limit} uses today</span>
             </div>
             {currentStep > 0 && (
               <button style={styles.resetButton} onClick={handleReset}>
@@ -2584,7 +2584,7 @@ function UploadStep({
       <div style={styles.uploadHero}>
         <h1 style={styles.heroTitle}>Transform Any Quiz into Canvas-Ready Format</h1>
         <p style={styles.heroSubtitle}>
-          Upload PDFs, Word documents, or paste text. Our AI extracts questions, detects answer keys, and handles messy formatting.
+          Upload PDFs, Word documents, or paste text. QuizForge extracts questions, detects answer keys, and handles messy formatting.
         </p>
       </div>
 
@@ -2767,7 +2767,7 @@ Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
           disabled={(uploadedFiles.length === 0 && !textInput.trim()) || !!processingStatus}
         >
           <Wand2 size={20} />
-          <span>Process Quiz with AI</span>
+          <span>Process Quiz</span>
           <ChevronRight size={20} />
         </button>
         {!apiKey && (
