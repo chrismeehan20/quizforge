@@ -266,10 +266,30 @@ async function extractTextFromPdf(file, pageStart = null, pageEnd = null) {
   }
 }
 
+// Cache for in-flight script loading promises to handle concurrent loads
+const scriptLoadPromises = {};
+
 function loadScript(src) {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
-      resolve();
+  // If we already have a promise for this script (loading or loaded), return it
+  if (scriptLoadPromises[src]) {
+    return scriptLoadPromises[src];
+  }
+
+  scriptLoadPromises[src] = new Promise((resolve, reject) => {
+    const existingScript = document.querySelector(`script[src="${src}"]`);
+    if (existingScript) {
+      // Script tag exists - check if it's already loaded by testing for expected global
+      if (src.includes('jszip') && window.JSZip) {
+        resolve();
+        return;
+      }
+      if (src.includes('pdf') && window.pdfjsLib) {
+        resolve();
+        return;
+      }
+      // Script tag exists but global not available - wait for it to load
+      existingScript.addEventListener('load', resolve);
+      existingScript.addEventListener('error', reject);
       return;
     }
     const script = document.createElement('script');
@@ -278,6 +298,8 @@ function loadScript(src) {
     script.onerror = reject;
     document.head.appendChild(script);
   });
+
+  return scriptLoadPromises[src];
 }
 
 function getImageDimensions(dataUrl) {
