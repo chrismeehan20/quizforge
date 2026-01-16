@@ -355,6 +355,649 @@ function applyAnswerKey(quiz, answers) {
 }
 
 // ============================================================================
+// LMS FORMAT PARSERS - QTI, Moodle XML, Blackboard
+// ============================================================================
+
+/**
+ * Detect LMS format from XML content
+ * @param {string} content - XML string
+ * @param {string} fileName - Original filename
+ * @returns {'qti_1.2'|'moodle_xml'|'blackboard_qti'|null}
+ */
+function detectLMSFormat(content, fileName) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(content, 'text/xml');
+    const root = doc.documentElement;
+
+    if (!root || doc.querySelector('parsererror')) {
+      return null;
+    }
+
+    // Check root element
+    if (root.tagName === 'questestinterop') {
+      // Check for Blackboard-specific elements
+      if (content.includes('bbmd_') || content.includes('bb_question_type')) {
+        return 'blackboard_qti';
+      }
+      return 'qti_1.2';
+    }
+
+    if (root.tagName === 'quiz') {
+      return 'moodle_xml';
+    }
+
+    return null;
+  } catch (err) {
+    console.error('Format detection error:', err);
+    return null;
+  }
+}
+
+/**
+ * Detect format from ZIP file (IMS package)
+ * @param {JSZip} zip - Loaded JSZip instance
+ * @returns {Promise<{format: string, qtiContent: string, zip: JSZip}|null>}
+ */
+async function detectZipFormat(zip) {
+  try {
+    // Check for IMS manifest
+    const manifestFile = zip.file('imsmanifest.xml');
+    if (!manifestFile) {
+      // Try looking for QTI XML directly
+      const files = Object.keys(zip.files);
+      const xmlFile = files.find(f => f.endsWith('.xml') && !f.includes('/'));
+      if (xmlFile) {
+        const content = await zip.file(xmlFile).async('string');
+        const format = detectLMSFormat(content, xmlFile);
+        if (format) {
+          return { format, qtiContent: content, zip };
+        }
+      }
+      return null;
+    }
+
+    const manifest = await manifestFile.async('string');
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(manifest, 'text/xml');
+
+    // Find QTI resource files
+    const resources = doc.querySelectorAll('resource');
+    for (const resource of resources) {
+      const type = resource.getAttribute('type') || '';
+      if (type.includes('qti') || type.includes('assessment')) {
+        const fileEl = resource.querySelector('file');
+        const href = fileEl?.getAttribute('href') || resource.getAttribute('href');
+        if (href) {
+          const qtiFile = zip.file(href);
+          if (qtiFile) {
+            const qtiContent = await qtiFile.async('string');
+            const format = detectLMSFormat(qtiContent, href);
+            if (format) {
+              return { format, qtiContent, zip };
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.error('ZIP format detection error:', err);
+    return null;
+  }
+}
+
+/**
+ * Strip HTML tags from content, preserving text
+ */
+function stripHTMLTags(html) {
+  if (!html) return '';
+  const temp = document.createElement('div');
+  temp.innerHTML = html;
+  let text = temp.textContent || temp.innerText || '';
+  text = text.replace(/\s+/g, ' ').trim();
+  return text;
+}
+
+/**
+ * Extract text from QTI mattext element (handles CDATA)
+ */
+function extractTextFromMattext(mattext) {
+  if (!mattext) return '';
+  let text = mattext.textContent || '';
+  // Check for HTML content
+  if (text.includes('<') && text.includes('>')) {
+    text = stripHTMLTags(text);
+  }
+  return text.trim();
+}
+
+/**
+ * Extract correct answer IDs from QTI item
+ */
+function extractCorrectAnswerIds(item) {
+  const correctIds = [];
+
+  // Method 1: Check respcondition with positive score
+  const respconditions = item.querySelectorAll('respcondition');
+  for (const rc of respconditions) {
+    const setvar = rc.querySelector('setvar');
+    if (setvar) {
+      const varname = setvar.getAttribute('varname') || setvar.getAttribute('name') || '';
+      const score = parseFloat(setvar.textContent);
+      if ((varname.toUpperCase() === 'SCORE' || varname === '') && score > 0) {
+        const varequal = rc.querySelector('varequal');
+        if (varequal) {
+          correctIds.push(varequal.textContent.trim());
+        }
+        // Also check for multiple correct via AND
+        const varequals = rc.querySelectorAll('varequal');
+        varequals.forEach(v => {
+          const id = v.textContent.trim();
+          if (id && !correctIds.includes(id)) {
+            correctIds.push(id);
+          }
+        });
+      }
+    }
+  }
+
+  // Method 2: Check for correctresponse element (Canvas style)
+  const correctResponse = item.querySelector('correctresponse');
+  if (correctResponse) {
+    const values = correctResponse.querySelectorAll('value');
+    values.forEach(v => {
+      const id = v.textContent.trim();
+      if (id && !correctIds.includes(id)) {
+        correctIds.push(id);
+      }
+    });
+  }
+
+  return [...new Set(correctIds)];
+}
+
+/**
+ * Extract images from QTI content
+ */
+async function extractImagesFromQTI(text, item, zip) {
+  const images = [];
+
+  // Find image references in HTML content
+  const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  let match;
+
+  while ((match = imgRegex.exec(text)) !== null) {
+    const src = match[1];
+
+    if (src.startsWith('data:')) {
+      // Already base64 encoded
+      images.push({
+        id: generateId(),
+        dataUrl: src,
+        filename: `image_${images.length + 1}`,
+        mimeType: src.split(';')[0].split(':')[1] || 'image/png',
+        source: 'qti'
+      });
+    } else if (zip) {
+      // Try to resolve from ZIP
+      // Handle IMS-CC-FILEBASE reference
+      let filePath = src.replace(/%24IMS-CC-FILEBASE%24\//gi, '');
+      filePath = decodeURIComponent(filePath);
+
+      const imageFile = zip.file(filePath) || zip.file('resources/' + filePath);
+      if (imageFile) {
+        try {
+          const imageData = await imageFile.async('arraybuffer');
+          const mimeType = detectImageType(new Uint8Array(imageData)) || 'image/png';
+          const base64 = arrayBufferToBase64(imageData);
+          images.push({
+            id: generateId(),
+            filename: filePath.split('/').pop(),
+            dataUrl: `data:${mimeType};base64,${base64}`,
+            mimeType,
+            source: 'qti'
+          });
+        } catch (e) {
+          console.warn('Failed to extract image:', filePath, e);
+        }
+      }
+    }
+  }
+
+  return images;
+}
+
+/**
+ * Parse a single QTI item element into a question
+ */
+async function parseQTIItem(item, index, zip) {
+  try {
+    // Get question type from metadata
+    const metadataFields = item.querySelectorAll('qtimetadatafield');
+    let qtiType = 'multiple_choice_question';
+    let points = 1;
+
+    for (const field of metadataFields) {
+      const label = field.querySelector('fieldlabel')?.textContent?.trim();
+      const entry = field.querySelector('fieldentry')?.textContent?.trim();
+      if (label === 'question_type') qtiType = entry;
+      if (label === 'points_possible') points = parseFloat(entry) || 1;
+    }
+
+    // Map QTI types to QuizForge types
+    const typeMap = {
+      'multiple_choice_question': 'multiple_choice',
+      'true_false_question': 'true_false',
+      'short_answer_question': 'short_answer',
+      'essay_question': 'essay',
+      'matching_question': 'matching',
+      'multiple_answers_question': 'multiple_select',
+      'fill_in_multiple_blanks_question': 'fill_blank',
+      'numerical_question': 'numerical',
+      'calculated_question': 'numerical',
+      'text_only_question': 'essay'
+    };
+
+    const type = typeMap[qtiType] || 'multiple_choice';
+
+    // Extract question text
+    const mattext = item.querySelector('presentation > material > mattext') ||
+                    item.querySelector('material > mattext');
+    let text = extractTextFromMattext(mattext);
+
+    // Extract images
+    const rawText = mattext?.textContent || '';
+    const images = await extractImagesFromQTI(rawText, item, zip);
+
+    // Clean image tags from text
+    text = text.replace(/<img[^>]*>/gi, '').trim();
+
+    // Extract options for choice questions
+    let options = [];
+    let correctAnswer = null;
+
+    if (type === 'multiple_choice' || type === 'true_false' || type === 'multiple_select') {
+      const responseLabels = item.querySelectorAll('response_label');
+      const correctIds = extractCorrectAnswerIds(item);
+
+      options = [...responseLabels].map((label, i) => {
+        const id = label.getAttribute('ident') || String.fromCharCode(97 + i);
+        const optionText = extractTextFromMattext(label.querySelector('mattext'));
+        const isCorrect = correctIds.includes(id);
+        if (isCorrect && !correctAnswer) correctAnswer = id;
+
+        return { id, text: optionText, isCorrect };
+      });
+
+      // For true/false, ensure proper IDs
+      if (type === 'true_false' && options.length === 2) {
+        options = options.map(opt => {
+          const lower = opt.text.toLowerCase();
+          if (lower === 'true' || lower === 't') {
+            return { ...opt, id: 't' };
+          } else if (lower === 'false' || lower === 'f') {
+            return { ...opt, id: 'f' };
+          }
+          return opt;
+        });
+        correctAnswer = options.find(o => o.isCorrect)?.id || null;
+      }
+    }
+
+    return {
+      id: `q${index + 1}`,
+      type,
+      text,
+      points,
+      options,
+      correctAnswer,
+      images,
+      confidence: 95,
+      warnings: []
+    };
+  } catch (err) {
+    console.error('Error parsing QTI item:', err);
+    return null;
+  }
+}
+
+/**
+ * Parse QTI 1.2 XML into QuizForge quiz format
+ */
+async function parseQTI12(xmlContent, zip = null) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlContent, 'text/xml');
+
+    const parseError = doc.querySelector('parsererror');
+    if (parseError) {
+      throw new Error('Invalid XML format');
+    }
+
+    const assessment = doc.querySelector('assessment');
+    const title = assessment?.getAttribute('title') || 'Imported QTI Quiz';
+
+    const items = doc.querySelectorAll('item');
+    const questions = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const question = await parseQTIItem(items[i], i, zip);
+      if (question) questions.push(question);
+    }
+
+    return {
+      id: generateId(),
+      title,
+      description: 'Imported from QTI file',
+      questions,
+      warnings: [],
+      metadata: {
+        sourceType: 'qti',
+        sourceFile: 'QTI Import',
+        createdAt: new Date().toISOString(),
+        parseConfidence: 95,
+        imageCount: questions.reduce((sum, q) => sum + (q.images?.length || 0), 0),
+        answerKeyFound: true
+      }
+    };
+  } catch (err) {
+    console.error('QTI parsing error:', err);
+    return {
+      id: generateId(),
+      title: 'Import Error',
+      description: 'Failed to parse QTI file: ' + err.message,
+      questions: [],
+      warnings: ['Import failed: ' + err.message],
+      metadata: { sourceType: 'qti', parseConfidence: 0 }
+    };
+  }
+}
+
+/**
+ * Parse Moodle XML format into QuizForge quiz format
+ */
+async function parseMoodleXML(xmlContent) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlContent, 'text/xml');
+
+    const parseError = doc.querySelector('parsererror');
+    if (parseError) {
+      throw new Error('Invalid XML format');
+    }
+
+    const questionElements = doc.querySelectorAll('question');
+    const questions = [];
+    let index = 0;
+
+    for (const qEl of questionElements) {
+      const qType = qEl.getAttribute('type');
+
+      // Skip category and description types
+      if (qType === 'category' || qType === 'description') continue;
+
+      const typeMap = {
+        'multichoice': 'multiple_choice',
+        'truefalse': 'true_false',
+        'shortanswer': 'short_answer',
+        'essay': 'essay',
+        'matching': 'matching',
+        'numerical': 'numerical',
+        'cloze': 'fill_blank',
+        'multianswer': 'fill_blank'
+      };
+
+      const type = typeMap[qType] || 'multiple_choice';
+
+      // Extract question text
+      const questionText = qEl.querySelector('questiontext > text')?.textContent || '';
+      const nameText = qEl.querySelector('name > text')?.textContent || '';
+      let text = stripHTMLTags(questionText) || nameText;
+
+      // Extract points
+      const defaultGrade = parseFloat(qEl.querySelector('defaultgrade')?.textContent) || 1;
+
+      // Extract options and correct answer
+      let options = [];
+      let correctAnswer = null;
+
+      if (type === 'multiple_choice' || type === 'true_false') {
+        const answers = qEl.querySelectorAll('answer');
+        options = [...answers].map((ans, i) => {
+          const fraction = parseFloat(ans.getAttribute('fraction')) || 0;
+          const id = String.fromCharCode(97 + i);
+          const isCorrect = fraction > 0;
+          if (isCorrect && !correctAnswer) correctAnswer = id;
+
+          return {
+            id,
+            text: stripHTMLTags(ans.querySelector('text')?.textContent || ''),
+            isCorrect
+          };
+        });
+
+        // Fix true/false IDs
+        if (type === 'true_false') {
+          options = options.map(opt => {
+            const lower = opt.text.toLowerCase();
+            if (lower === 'true' || lower === 't') return { ...opt, id: 't' };
+            if (lower === 'false' || lower === 'f') return { ...opt, id: 'f' };
+            return opt;
+          });
+          correctAnswer = options.find(o => o.isCorrect)?.id || null;
+        }
+      }
+
+      questions.push({
+        id: `q${++index}`,
+        type,
+        text,
+        points: defaultGrade,
+        options,
+        correctAnswer,
+        images: [],
+        confidence: 90,
+        warnings: []
+      });
+    }
+
+    return {
+      id: generateId(),
+      title: 'Imported Moodle Quiz',
+      description: 'Imported from Moodle XML format',
+      questions,
+      warnings: [],
+      metadata: {
+        sourceType: 'moodle',
+        sourceFile: 'Moodle Import',
+        createdAt: new Date().toISOString(),
+        parseConfidence: 90,
+        imageCount: 0,
+        answerKeyFound: true
+      }
+    };
+  } catch (err) {
+    console.error('Moodle parsing error:', err);
+    return {
+      id: generateId(),
+      title: 'Import Error',
+      description: 'Failed to parse Moodle file: ' + err.message,
+      questions: [],
+      warnings: ['Import failed: ' + err.message],
+      metadata: { sourceType: 'moodle', parseConfidence: 0 }
+    };
+  }
+}
+
+/**
+ * Parse Blackboard QTI variant into QuizForge quiz format
+ */
+async function parseBlackboardQTI(xmlContent, zip = null) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlContent, 'text/xml');
+
+    const parseError = doc.querySelector('parsererror');
+    if (parseError) {
+      throw new Error('Invalid XML format');
+    }
+
+    const assessment = doc.querySelector('assessment');
+    const title = assessment?.getAttribute('title') || 'Imported Blackboard Quiz';
+
+    const items = doc.querySelectorAll('item');
+    const questions = [];
+
+    // Blackboard type mapping
+    const bbTypeMap = {
+      'Multiple Choice': 'multiple_choice',
+      'True/False': 'true_false',
+      'Short Response': 'short_answer',
+      'Essay': 'essay',
+      'Matching': 'matching',
+      'Fill in the Blank': 'fill_blank',
+      'Numeric': 'numerical',
+      'Multiple Answer': 'multiple_select'
+    };
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+
+      // Get Blackboard-specific type
+      const bbType = item.querySelector('bbmd_questiontype')?.textContent || '';
+      const type = bbTypeMap[bbType] || 'multiple_choice';
+
+      // Extract question text
+      const mattext = item.querySelector('presentation > flow > material > mat_extension > mat_formattedtext') ||
+                      item.querySelector('material > mattext');
+      let text = extractTextFromMattext(mattext);
+
+      // Extract images
+      const rawText = mattext?.textContent || '';
+      const images = await extractImagesFromQTI(rawText, item, zip);
+      text = text.replace(/<img[^>]*>/gi, '').trim();
+
+      // Get points
+      const pointsEl = item.querySelector('bbmd_asi_object_id')?.nextElementSibling;
+      const points = parseFloat(item.querySelector('qmd_absolutescore_max')?.textContent) || 1;
+
+      // Extract options
+      let options = [];
+      let correctAnswer = null;
+
+      if (type === 'multiple_choice' || type === 'true_false' || type === 'multiple_select') {
+        const responseLabels = item.querySelectorAll('response_label');
+        const correctIds = extractCorrectAnswerIds(item);
+
+        options = [...responseLabels].map((label, idx) => {
+          const id = label.getAttribute('ident') || String.fromCharCode(97 + idx);
+          const optMattext = label.querySelector('mat_formattedtext') || label.querySelector('mattext');
+          const optionText = extractTextFromMattext(optMattext);
+          const isCorrect = correctIds.includes(id);
+          if (isCorrect && !correctAnswer) correctAnswer = id;
+
+          return { id, text: optionText, isCorrect };
+        });
+      }
+
+      questions.push({
+        id: `q${i + 1}`,
+        type,
+        text,
+        points,
+        options,
+        correctAnswer,
+        images,
+        confidence: 88,
+        warnings: []
+      });
+    }
+
+    return {
+      id: generateId(),
+      title,
+      description: 'Imported from Blackboard',
+      questions,
+      warnings: [],
+      metadata: {
+        sourceType: 'blackboard',
+        sourceFile: 'Blackboard Import',
+        createdAt: new Date().toISOString(),
+        parseConfidence: 88,
+        imageCount: questions.reduce((sum, q) => sum + (q.images?.length || 0), 0),
+        answerKeyFound: true
+      }
+    };
+  } catch (err) {
+    console.error('Blackboard parsing error:', err);
+    return {
+      id: generateId(),
+      title: 'Import Error',
+      description: 'Failed to parse Blackboard file: ' + err.message,
+      questions: [],
+      warnings: ['Import failed: ' + err.message],
+      metadata: { sourceType: 'blackboard', parseConfidence: 0 }
+    };
+  }
+}
+
+/**
+ * Merge multiple quizzes into one
+ */
+function mergeQuizzes(primaryQuiz, importedQuizzes) {
+  if (importedQuizzes.length === 0 && primaryQuiz) {
+    return primaryQuiz;
+  }
+
+  if (!primaryQuiz && importedQuizzes.length === 1) {
+    return importedQuizzes[0];
+  }
+
+  if (!primaryQuiz && importedQuizzes.length === 0) {
+    return null;
+  }
+
+  // Combine all quizzes
+  const allQuizzes = primaryQuiz
+    ? [primaryQuiz, ...importedQuizzes]
+    : importedQuizzes;
+
+  // Re-number questions
+  let questionIndex = 0;
+  const allQuestions = allQuizzes.flatMap(quiz =>
+    quiz.questions.map(q => ({
+      ...q,
+      id: `q${++questionIndex}`
+    }))
+  );
+
+  // Use first quiz as base
+  const baseQuiz = allQuizzes[0];
+
+  return {
+    id: generateId(),
+    title: allQuizzes.length > 1 ? 'Combined Quiz' : baseQuiz.title,
+    description: allQuizzes.length > 1
+      ? `Combined from ${allQuizzes.length} sources`
+      : baseQuiz.description,
+    questions: allQuestions,
+    warnings: allQuizzes.flatMap(q => q.warnings || []),
+    metadata: {
+      sourceType: allQuizzes.length > 1 ? 'merged' : baseQuiz.metadata?.sourceType,
+      sourceCount: allQuizzes.length,
+      createdAt: new Date().toISOString(),
+      parseConfidence: Math.round(
+        allQuizzes.reduce((sum, q) => sum + (q.metadata?.parseConfidence || 80), 0) / allQuizzes.length
+      ),
+      imageCount: allQuestions.reduce((sum, q) => sum + (q.images?.length || 0), 0),
+      answerKeyFound: allQuizzes.some(q => q.metadata?.answerKeyFound)
+    }
+  };
+}
+
+// ============================================================================
 // MAIN APP COMPONENT
 // ============================================================================
 
@@ -366,7 +1009,8 @@ export default function QuizForge() {
   const [processingProgress, setProcessingProgress] = useState(0);
   const [processingStatus, setProcessingStatus] = useState('');
   const [uploadedFiles, setUploadedFiles] = useState([]);
-  const [extractedContents, setExtractedContents] = useState([]); // { file, text, images, fileType }
+  const [extractedContents, setExtractedContents] = useState([]); // { file, text, images, fileType, parsedQuiz }
+  const [importedQuizzes, setImportedQuizzes] = useState([]); // Pre-parsed LMS quizzes
   const [textInput, setTextInput] = useState('');
   const [showTextInput, setShowTextInput] = useState(false);
   const [apiKey, setApiKey] = useState('');
@@ -435,16 +1079,18 @@ export default function QuizForge() {
   const handleFilesSelect = async (newFiles) => {
     if (!newFiles || newFiles.length === 0) return;
 
-    // Filter valid files
+    // Filter valid files (including LMS formats)
     const validFiles = newFiles.filter(file => {
       const name = file.name.toLowerCase();
       return name.endsWith('.pdf') || name.endsWith('.docx') ||
-             name.endsWith('.txt') || file.type === 'application/pdf' ||
-             file.type === 'text/plain';
+             name.endsWith('.txt') || name.endsWith('.xml') ||
+             name.endsWith('.zip') || file.type === 'application/pdf' ||
+             file.type === 'text/plain' || file.type === 'text/xml' ||
+             file.type === 'application/xml' || file.type === 'application/zip';
     });
 
     if (validFiles.length === 0) {
-      setError('Please upload PDF, Word (.docx), or text files.');
+      setError('Please upload PDF, Word (.docx), text, QTI (.xml), or LMS package (.zip) files.');
       return;
     }
 
@@ -462,16 +1108,22 @@ export default function QuizForge() {
     setError(null);
 
     // Extract content from new files
-    setProcessingStatus(`Extracting content from ${uniqueNewFiles.length} file(s)...`);
+    setProcessingStatus(`Processing ${uniqueNewFiles.length} file(s)...`);
 
     try {
       const newContents = await Promise.all(uniqueNewFiles.map(async (file) => {
         const fileName = file.name.toLowerCase();
-        const fileType = fileName.endsWith('.pdf') ? 'pdf' :
-                         fileName.endsWith('.docx') ? 'docx' : 'txt';
+
+        // Determine file type
+        let fileType = 'txt';
+        if (fileName.endsWith('.pdf')) fileType = 'pdf';
+        else if (fileName.endsWith('.docx')) fileType = 'docx';
+        else if (fileName.endsWith('.xml')) fileType = 'lms_xml';
+        else if (fileName.endsWith('.zip')) fileType = 'lms_zip';
 
         let text = '';
         let images = [];
+        let parsedQuiz = null;
 
         if (fileType === 'txt') {
           text = await file.text();
@@ -482,28 +1134,89 @@ export default function QuizForge() {
           ]);
         } else if (fileType === 'pdf') {
           text = await extractTextFromPdf(file);
+        } else if (fileType === 'lms_xml') {
+          // Parse XML LMS format
+          const xmlContent = await file.text();
+          const format = detectLMSFormat(xmlContent, file.name);
+
+          if (format === 'qti_1.2') {
+            parsedQuiz = await parseQTI12(xmlContent);
+          } else if (format === 'moodle_xml') {
+            parsedQuiz = await parseMoodleXML(xmlContent);
+          } else if (format === 'blackboard_qti') {
+            parsedQuiz = await parseBlackboardQTI(xmlContent);
+          }
+
+          if (parsedQuiz && parsedQuiz.questions.length > 0) {
+            text = `[LMS Quiz: ${parsedQuiz.title}]\n${parsedQuiz.questions.length} questions imported`;
+            images = parsedQuiz.questions.flatMap(q => q.images || []);
+          } else {
+            // Not a recognized LMS format, treat as plain text
+            text = xmlContent;
+            fileType = 'txt';
+          }
+        } else if (fileType === 'lms_zip') {
+          // Parse ZIP IMS package
+          if (!window.JSZip) {
+            await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+          }
+          const arrayBuffer = await file.arrayBuffer();
+          const zip = await window.JSZip.loadAsync(arrayBuffer);
+          const detected = await detectZipFormat(zip);
+
+          if (detected) {
+            if (detected.format === 'qti_1.2') {
+              parsedQuiz = await parseQTI12(detected.qtiContent, detected.zip);
+            } else if (detected.format === 'blackboard_qti') {
+              parsedQuiz = await parseBlackboardQTI(detected.qtiContent, detected.zip);
+            } else if (detected.format === 'moodle_xml') {
+              parsedQuiz = await parseMoodleXML(detected.qtiContent);
+            }
+
+            if (parsedQuiz && parsedQuiz.questions.length > 0) {
+              text = `[LMS Package: ${parsedQuiz.title}]\n${parsedQuiz.questions.length} questions imported`;
+              images = parsedQuiz.questions.flatMap(q => q.images || []);
+            }
+          }
+
+          if (!parsedQuiz) {
+            setError(`Could not parse LMS package: ${file.name}`);
+          }
         }
 
-        return { file, text, images, fileType };
+        return { file, text, images, fileType, parsedQuiz };
       }));
 
       // Update extracted contents
       const updatedContents = [...extractedContents, ...newContents];
       setExtractedContents(updatedContents);
 
-      // Concatenate all text
-      const combinedText = updatedContents.map(c =>
-        `--- ${c.file.name} ---\n${c.text}`
-      ).join('\n\n');
+      // Collect new parsed quizzes
+      const newParsedQuizzes = newContents
+        .filter(c => c.parsedQuiz && c.parsedQuiz.questions.length > 0)
+        .map(c => c.parsedQuiz);
+
+      if (newParsedQuizzes.length > 0) {
+        setImportedQuizzes(prev => [...prev, ...newParsedQuizzes]);
+      }
+
+      // Concatenate all text (excluding LMS placeholder text for combined view)
+      const textContents = updatedContents.filter(c => !c.text.startsWith('[LMS'));
+      const combinedText = textContents.length > 0
+        ? textContents.map(c => `--- ${c.file.name} ---\n${c.text}`).join('\n\n')
+        : '';
       setExtractedText(combinedText);
       setTextInput(combinedText);
 
       // Combine all images
-      const allImages = updatedContents.flatMap(c => c.images);
+      const allImages = updatedContents.flatMap(c => c.images || []);
       setExtractedImages(allImages);
 
-      // Set file type based on first file (for display purposes)
-      if (updatedContents.length > 0) {
+      // Set file type based on first non-LMS file
+      const firstNonLMS = updatedContents.find(c => !c.fileType.startsWith('lms'));
+      if (firstNonLMS) {
+        setFileType(firstNonLMS.fileType);
+      } else if (updatedContents.length > 0) {
         setFileType(updatedContents[0].fileType);
       }
 
@@ -519,19 +1232,35 @@ export default function QuizForge() {
     setExtractedContents(prev => {
       const updated = prev.filter(c => c.file.name !== fileName);
 
-      // Recalculate combined text
-      if (updated.length > 0) {
-        const combinedText = updated.map(c =>
+      // Also remove any parsed quiz from this file
+      const removedContent = prev.find(c => c.file.name === fileName);
+      if (removedContent?.parsedQuiz) {
+        setImportedQuizzes(prevQuizzes =>
+          prevQuizzes.filter(q => q.id !== removedContent.parsedQuiz.id)
+        );
+      }
+
+      // Recalculate combined text (excluding LMS placeholder text)
+      const textContents = updated.filter(c => !c.text.startsWith('[LMS'));
+      if (textContents.length > 0) {
+        const combinedText = textContents.map(c =>
           `--- ${c.file.name} ---\n${c.text}`
         ).join('\n\n');
         setExtractedText(combinedText);
         setTextInput(combinedText);
-        setExtractedImages(updated.flatMap(c => c.images));
-        setFileType(updated[0].fileType);
       } else {
         setExtractedText('');
         setTextInput('');
-        setExtractedImages([]);
+      }
+
+      setExtractedImages(updated.flatMap(c => c.images || []));
+
+      const firstNonLMS = updated.find(c => !c.fileType?.startsWith('lms'));
+      if (firstNonLMS) {
+        setFileType(firstNonLMS.fileType);
+      } else if (updated.length > 0) {
+        setFileType(updated[0].fileType);
+      } else {
         setFileType(null);
       }
 
@@ -542,6 +1271,7 @@ export default function QuizForge() {
   const clearAllFiles = () => {
     setUploadedFiles([]);
     setExtractedContents([]);
+    setImportedQuizzes([]);
     setExtractedText('');
     setTextInput('');
     setExtractedImages([]);
@@ -553,7 +1283,36 @@ export default function QuizForge() {
     setIsProcessing(true);
     setProcessingProgress(0);
     setProcessingStatus('Initializing...');
-    
+
+    // Check if we only have imported LMS quizzes (no text content to parse)
+    const hasTextContent = content && content.trim().length > 0;
+    const hasImportedQuizzes = importedQuizzes.length > 0;
+
+    if (!hasTextContent && hasImportedQuizzes) {
+      // Only imported quizzes, skip AI parsing
+      setProcessingProgress(50);
+      setProcessingStatus('Merging imported quizzes...');
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const mergedQuiz = mergeQuizzes(null, importedQuizzes);
+
+      setProcessingProgress(100);
+      setProcessingStatus('Complete!');
+
+      setTimeout(() => {
+        setQuiz(mergedQuiz);
+        setQuizSettings(prev => ({
+          ...prev,
+          title: mergedQuiz.title || 'Imported Quiz',
+          description: mergedQuiz.description || '',
+        }));
+        setIsProcessing(false);
+        setCurrentStep(2);
+      }, 500);
+      return;
+    }
+
     try {
       const stages = [
         { progress: 10, status: 'Reading document...' },
@@ -673,32 +1432,37 @@ ${content}
 
         setProcessingProgress(100);
         setProcessingStatus('Complete!');
-        
+
         setTimeout(() => {
-          setQuiz({
+          const aiQuiz = {
             ...parsedQuiz,
             id: generateId(),
             metadata: {
               sourceType: fileType || 'text',
-              sourceFile: uploadedFile?.name || 'Text Input',
+              sourceFile: uploadedFiles.length > 0 ? uploadedFiles[0].name : 'Text Input',
               createdAt: new Date().toISOString(),
               parseConfidence: Math.round(
-                parsedQuiz.questions.reduce((acc, q) => acc + (q.confidence || 80), 0) / 
+                parsedQuiz.questions.reduce((acc, q) => acc + (q.confidence || 80), 0) /
                 parsedQuiz.questions.length
               ),
               imageCount: extractedImages.length,
               answerKeyFound: parsedQuiz.answerKeyFound || false,
             }
-          });
+          };
+
+          // Merge with imported quizzes if any
+          const finalQuiz = hasImportedQuizzes ? mergeQuizzes(aiQuiz, importedQuizzes) : aiQuiz;
+
+          setQuiz(finalQuiz);
           setQuizSettings(prev => ({
             ...prev,
-            title: parsedQuiz.title || 'Untitled Quiz',
-            description: parsedQuiz.description || '',
+            title: finalQuiz.title || 'Untitled Quiz',
+            description: finalQuiz.description || '',
           }));
           setIsProcessing(false);
           setCurrentStep(2);
         }, 500);
-        
+
       } else {
         // Demo mode
         for (let i = 0; i < stages.length; i++) {
@@ -706,15 +1470,18 @@ ${content}
           setProcessingProgress(stages[i].progress);
           setProcessingStatus(stages[i].status);
         }
-        
+
         const demoQuiz = parseDemoQuiz(content);
-        
+
+        // Merge with imported quizzes if any
+        const finalQuiz = hasImportedQuizzes ? mergeQuizzes(demoQuiz, importedQuizzes) : demoQuiz;
+
         setTimeout(() => {
-          setQuiz(demoQuiz);
+          setQuiz(finalQuiz);
           setQuizSettings(prev => ({
             ...prev,
-            title: demoQuiz.title || 'Untitled Quiz',
-            description: demoQuiz.description || '',
+            title: finalQuiz.title || 'Untitled Quiz',
+            description: finalQuiz.description || '',
           }));
           setIsProcessing(false);
           setCurrentStep(2);
@@ -1508,6 +2275,7 @@ ${resourceRefs}
     setSelectedQuestionIndex(0);
     setUploadedFiles([]);
     setExtractedContents([]);
+    setImportedQuizzes([]);
     setTextInput('');
     setExtractedText('');
     setError(null);
@@ -1636,6 +2404,7 @@ ${resourceRefs}
             extractedText={extractedText}
             fileType={fileType}
             processingStatus={processingStatus}
+            importedQuizzes={importedQuizzes}
             onDrop={handleDrop}
             onFilesSelect={handleFilesSelect}
             onRemoveFile={removeFile}
@@ -1656,6 +2425,7 @@ ${resourceRefs}
             extractedText={extractedText}
             fileType={fileType}
             processingStatus={processingStatus}
+            importedQuizzes={importedQuizzes}
             generationConfig={generationConfig}
             pageRange={pageRange}
             onDrop={handleDrop}
@@ -1749,7 +2519,7 @@ ${resourceRefs}
 
 function UploadStep({
   uploadedFiles, textInput, showTextInput, fileInputRef, error, apiKey,
-  extractedImages, extractedText, fileType, processingStatus,
+  extractedImages, extractedText, fileType, processingStatus, importedQuizzes,
   onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onTextChange, onToggleTextInput, onStartProcessing, onLoadSample,
 }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -1758,6 +2528,8 @@ function UploadStep({
     const name = file.name.toLowerCase();
     if (name.endsWith('.pdf')) return <FileType size={20} color="#ef4444" />;
     if (name.endsWith('.docx')) return <FileText size={20} color="#3b82f6" />;
+    if (name.endsWith('.xml')) return <BookOpen size={20} color="#10b981" />;
+    if (name.endsWith('.zip')) return <Download size={20} color="#8b5cf6" />;
     return <FileText size={20} color="#64748b" />;
   };
 
@@ -1788,7 +2560,7 @@ function UploadStep({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.doc,.docx,.txt"
+            accept=".pdf,.doc,.docx,.txt,.xml,.zip"
             multiple
             style={{ display: 'none' }}
             onChange={(e) => {
@@ -1868,6 +2640,21 @@ function UploadStep({
                   </div>
                 </div>
               )}
+
+              {importedQuizzes.length > 0 && (
+                <div style={styles.importedQuizSummary}>
+                  <div style={styles.importedQuizHeader}>
+                    <CheckCircle2 size={16} color="#8b5cf6" />
+                    <span>{importedQuizzes.length} LMS quiz(es) detected</span>
+                  </div>
+                  {importedQuizzes.map((quiz, i) => (
+                    <div key={quiz.id || i} style={styles.importedQuizItem}>
+                      <span style={styles.importedQuizTitle}>{quiz.title}</span>
+                      <span style={styles.importedQuizCount}>{quiz.questions.length} questions</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <>
@@ -1879,6 +2666,8 @@ function UploadStep({
                 <span style={styles.formatBadge}><FileType size={14} /> PDF</span>
                 <span style={styles.formatBadge}><FileText size={14} /> DOCX</span>
                 <span style={styles.formatBadge}><AlignLeft size={14} /> TXT</span>
+                <span style={styles.formatBadge}><Download size={14} /> QTI</span>
+                <span style={styles.formatBadge}><BookOpen size={14} /> Moodle</span>
               </div>
             </>
           )}
@@ -1956,7 +2745,7 @@ Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
 // ============================================================================
 
 function GenerateUploadStep({
-  uploadedFiles, fileInputRef, error, apiKey, extractedText, fileType, processingStatus,
+  uploadedFiles, fileInputRef, error, apiKey, extractedText, fileType, processingStatus, importedQuizzes,
   generationConfig, pageRange,
   onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onConfigChange, onPageRangeChange, onGenerate
 }) {
@@ -1995,6 +2784,8 @@ function GenerateUploadStep({
     const name = file.name.toLowerCase();
     if (name.endsWith('.pdf')) return <FileType size={20} color="#ef4444" />;
     if (name.endsWith('.docx')) return <FileText size={20} color="#3b82f6" />;
+    if (name.endsWith('.xml')) return <BookOpen size={20} color="#10b981" />;
+    if (name.endsWith('.zip')) return <Download size={20} color="#8b5cf6" />;
     return <FileText size={20} color="#64748b" />;
   };
 
@@ -2032,7 +2823,7 @@ function GenerateUploadStep({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.doc,.docx,.txt"
+              accept=".pdf,.doc,.docx,.txt,.xml,.zip"
               multiple
               style={{ display: 'none' }}
               onChange={(e) => {
@@ -2093,6 +2884,21 @@ function GenerateUploadStep({
                     <span>{extractedText.length.toLocaleString()} total characters extracted</span>
                   </div>
                 )}
+
+                {importedQuizzes && importedQuizzes.length > 0 && (
+                  <div style={styles.importedQuizSummary}>
+                    <div style={styles.importedQuizHeader}>
+                      <CheckCircle2 size={16} color="#8b5cf6" />
+                      <span>{importedQuizzes.length} LMS quiz(es) detected</span>
+                    </div>
+                    {importedQuizzes.map((quiz, i) => (
+                      <div key={quiz.id || i} style={styles.importedQuizItem}>
+                        <span style={styles.importedQuizTitle}>{quiz.title}</span>
+                        <span style={styles.importedQuizCount}>{quiz.questions.length} questions</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -2104,6 +2910,8 @@ function GenerateUploadStep({
                   <span style={styles.formatBadge}><FileType size={14} /> PDF</span>
                   <span style={styles.formatBadge}><FileText size={14} /> DOCX</span>
                   <span style={styles.formatBadge}><AlignLeft size={14} /> TXT</span>
+                  <span style={styles.formatBadge}><Download size={14} /> QTI</span>
+                  <span style={styles.formatBadge}><BookOpen size={14} /> Moodle</span>
                 </div>
               </>
             )}
@@ -3141,6 +3949,11 @@ const styles = {
   extractedThumb: { width: '60px', height: '60px', borderRadius: '8px', overflow: 'hidden', border: '2px solid #e5e7eb' },
   extractedThumbImg: { width: '100%', height: '100%', objectFit: 'cover' },
   extractedThumbMore: { width: '60px', height: '60px', borderRadius: '8px', backgroundColor: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '13px', fontWeight: '600', color: '#64748b' },
+  importedQuizSummary: { borderTop: '1px solid #e5e7eb', paddingTop: '16px', marginTop: '8px' },
+  importedQuizHeader: { display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px', fontWeight: '500', color: '#8b5cf6', marginBottom: '8px' },
+  importedQuizItem: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#f5f3ff', borderRadius: '6px', marginBottom: '4px' },
+  importedQuizTitle: { fontSize: '13px', fontWeight: '500', color: '#4c1d95' },
+  importedQuizCount: { fontSize: '12px', color: '#7c3aed', backgroundColor: '#ede9fe', padding: '2px 8px', borderRadius: '10px' },
   divider: { display: 'flex', alignItems: 'center', justifyContent: 'center' },
   dividerText: { fontSize: '13px', color: '#9ca3af', fontWeight: '500' },
   textInputToggle: { display: 'flex', alignItems: 'center', gap: '12px', width: '100%', padding: '16px 20px', border: '1px solid #e5e7eb', borderRadius: '12px', backgroundColor: '#fff', color: '#374151', fontSize: '15px', fontWeight: '500', cursor: 'pointer' },
