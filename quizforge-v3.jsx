@@ -58,64 +58,6 @@ const QUESTION_TYPES = {
   numerical: { label: 'Numerical', icon: Hash, color: '#6366f1' },
 };
 
-const SAMPLE_QUIZ_TEXT = `Biology Chapter 5 Test - Cell Structure and Function
-
-Instructions: Answer all questions. Each multiple choice question is worth 2 points.
-
-1. What is the powerhouse of the cell?
-A) Nucleus
-B) Mitochondria
-C) Ribosome
-D) Golgi apparatus
-
-2) The cell membrane is primarily composed of:
-a. Carbohydrates
-b. Proteins only
-c. Phospholipids and proteins
-d. Nucleic acids
-
-3. True or False: Plant cells have cell walls while animal cells do not.
-
-4. Which organelle is responsible for protein synthesis?
-A) Lysosome
-B) Ribosome
-C) Vacuole
-D) Chloroplast
-
-5) What type of transport requires energy from the cell?
-A. Osmosis
-B. Diffusion
-C. Active transport
-D. Facilitated diffusion
-
-6. The process by which cells divide is called:
-A) Photosynthesis
-B) Mitosis
-C) Respiration
-D) Osmosis
-
-7. Which structure is found in plant cells but not animal cells?
-A) Nucleus
-B) Mitochondria
-C) Chloroplast
-D) Ribosome
-
-8. True or False: All cells contain a nucleus.
-
-9. What is the function of the vacuole?
-A) Energy production
-B) Storage of materials
-C) Protein synthesis
-D) Cell division
-
-10. The endoplasmic reticulum is responsible for:
-A) Transporting materials within the cell
-B) Producing energy
-C) Storing genetic information
-D) Breaking down waste
-
-Answer Key: 1-B, 2-C, 3-True, 4-B, 5-C, 6-B, 7-C, 8-False, 9-B, 10-A`;
-
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -213,6 +155,198 @@ async function extractTextFromDocx(file) {
   }
 }
 
+// OMML to LaTeX conversion map for common elements
+const OMML_TO_LATEX = {
+  // Greek letters
+  'α': '\\alpha', 'β': '\\beta', 'γ': '\\gamma', 'δ': '\\delta', 'ε': '\\epsilon',
+  'ζ': '\\zeta', 'η': '\\eta', 'θ': '\\theta', 'ι': '\\iota', 'κ': '\\kappa',
+  'λ': '\\lambda', 'μ': '\\mu', 'ν': '\\nu', 'ξ': '\\xi', 'π': '\\pi',
+  'ρ': '\\rho', 'σ': '\\sigma', 'τ': '\\tau', 'υ': '\\upsilon', 'φ': '\\phi',
+  'χ': '\\chi', 'ψ': '\\psi', 'ω': '\\omega',
+  'Γ': '\\Gamma', 'Δ': '\\Delta', 'Θ': '\\Theta', 'Λ': '\\Lambda', 'Ξ': '\\Xi',
+  'Π': '\\Pi', 'Σ': '\\Sigma', 'Φ': '\\Phi', 'Ψ': '\\Psi', 'Ω': '\\Omega',
+  // Operators
+  '±': '\\pm', '×': '\\times', '÷': '\\div', '≤': '\\leq', '≥': '\\geq',
+  '≠': '\\neq', '≈': '\\approx', '∞': '\\infty', '∑': '\\sum', '∏': '\\prod',
+  '∫': '\\int', '∂': '\\partial', '√': '\\sqrt', '∈': '\\in', '∉': '\\notin',
+  '⊂': '\\subset', '⊃': '\\supset', '∪': '\\cup', '∩': '\\cap', '∧': '\\land',
+  '∨': '\\lor', '¬': '\\neg', '→': '\\rightarrow', '←': '\\leftarrow',
+  '↔': '\\leftrightarrow', '⇒': '\\Rightarrow', '⇔': '\\Leftrightarrow',
+};
+
+function convertOmmlToLatex(ommlElement) {
+  // Helper to get text content from a node
+  const getText = (node) => node?.textContent?.trim() || '';
+
+  // Process an OMML node recursively
+  function processNode(node) {
+    if (!node) return '';
+
+    const tagName = node.tagName?.split(':').pop() || node.nodeName?.split(':').pop();
+
+    switch (tagName) {
+      case 'f': { // Fraction
+        const num = node.querySelector('num') || node.getElementsByTagName('m:num')[0];
+        const den = node.querySelector('den') || node.getElementsByTagName('m:den')[0];
+        return `\\frac{${processChildren(num)}}{${processChildren(den)}}`;
+      }
+      case 'rad': { // Radical/Square root
+        const deg = node.querySelector('deg') || node.getElementsByTagName('m:deg')[0];
+        const e = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        const degText = processChildren(deg);
+        if (degText && degText !== '2') {
+          return `\\sqrt[${degText}]{${processChildren(e)}}`;
+        }
+        return `\\sqrt{${processChildren(e)}}`;
+      }
+      case 'sSup': { // Superscript
+        const base = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        const sup = node.querySelector('sup') || node.getElementsByTagName('m:sup')[0];
+        return `{${processChildren(base)}}^{${processChildren(sup)}}`;
+      }
+      case 'sSub': { // Subscript
+        const base = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        const sub = node.querySelector('sub') || node.getElementsByTagName('m:sub')[0];
+        return `{${processChildren(base)}}_{${processChildren(sub)}}`;
+      }
+      case 'sSubSup': { // Both subscript and superscript
+        const base = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        const sub = node.querySelector('sub') || node.getElementsByTagName('m:sub')[0];
+        const sup = node.querySelector('sup') || node.getElementsByTagName('m:sup')[0];
+        return `{${processChildren(base)}}_{${processChildren(sub)}}^{${processChildren(sup)}}`;
+      }
+      case 'nary': { // N-ary operators (sum, product, integral)
+        const chr = node.querySelector('naryPr chr')?.getAttribute('m:val') ||
+                    node.querySelector('chr')?.getAttribute('val') || '∑';
+        const sub = node.querySelector('sub') || node.getElementsByTagName('m:sub')[0];
+        const sup = node.querySelector('sup') || node.getElementsByTagName('m:sup')[0];
+        const e = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        let op = OMML_TO_LATEX[chr] || chr;
+        let result = op;
+        if (sub) result += `_{${processChildren(sub)}}`;
+        if (sup) result += `^{${processChildren(sup)}}`;
+        result += ` ${processChildren(e)}`;
+        return result;
+      }
+      case 'd': { // Delimiters (parentheses, brackets, etc.)
+        const begChr = node.querySelector('dPr begChr')?.getAttribute('m:val') ||
+                       node.querySelector('begChr')?.getAttribute('val') || '(';
+        const endChr = node.querySelector('dPr endChr')?.getAttribute('m:val') ||
+                       node.querySelector('endChr')?.getAttribute('val') || ')';
+        const e = node.querySelector('e') || node.getElementsByTagName('m:e')[0];
+        const leftDelim = begChr === '(' ? '(' : begChr === '[' ? '[' : begChr === '{' ? '\\{' : begChr;
+        const rightDelim = endChr === ')' ? ')' : endChr === ']' ? ']' : endChr === '}' ? '\\}' : endChr;
+        return `\\left${leftDelim}${processChildren(e)}\\right${rightDelim}`;
+      }
+      case 'r': { // Run of text
+        const text = getText(node.querySelector('t') || node.getElementsByTagName('m:t')[0] || node);
+        // Convert special characters
+        return text.split('').map(c => OMML_TO_LATEX[c] || c).join('');
+      }
+      case 't': // Text
+        return getText(node).split('').map(c => OMML_TO_LATEX[c] || c).join('');
+      case 'oMath': // Math container
+      case 'e': // Element
+      case 'num': // Numerator
+      case 'den': // Denominator
+      case 'sup': // Superscript content
+      case 'sub': // Subscript content
+      case 'deg': // Degree
+        return processChildren(node);
+      default:
+        return processChildren(node);
+    }
+  }
+
+  function processChildren(node) {
+    if (!node) return '';
+    let result = '';
+    for (const child of node.childNodes) {
+      if (child.nodeType === 1) { // Element node
+        result += processNode(child);
+      } else if (child.nodeType === 3) { // Text node
+        const text = child.textContent.trim();
+        if (text) {
+          result += text.split('').map(c => OMML_TO_LATEX[c] || c).join('');
+        }
+      }
+    }
+    return result;
+  }
+
+  return processNode(ommlElement);
+}
+
+async function extractOmmlFromDocx(file) {
+  try {
+    if (!window.JSZip) {
+      await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const zip = await window.JSZip.loadAsync(arrayBuffer);
+    const documentXml = await zip.file('word/document.xml')?.async('string');
+    if (!documentXml) return { text: '', hasEquations: false };
+
+    // Parse as XML to find math elements
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(documentXml, 'text/xml');
+
+    // Find all OMML math elements
+    const mathElements = doc.getElementsByTagName('m:oMath');
+    const equations = [];
+
+    for (let i = 0; i < mathElements.length; i++) {
+      const latex = convertOmmlToLatex(mathElements[i]);
+      if (latex.trim()) {
+        equations.push(latex.trim());
+      }
+    }
+
+    // Now extract text but replace math elements with LaTeX placeholders
+    let text = documentXml;
+
+    // Replace OMML blocks with LaTeX
+    let equationIndex = 0;
+    text = text.replace(/<m:oMathPara[^>]*>[\s\S]*?<\/m:oMathPara>/g, () => {
+      const latex = equations[equationIndex] || '';
+      equationIndex++;
+      return `\n$$${latex}$$\n`; // Display math
+    });
+
+    // Replace inline OMML
+    equationIndex = 0;
+    text = text.replace(/<m:oMath[^>]*>[\s\S]*?<\/m:oMath>/g, () => {
+      const latex = equations[equationIndex] || '';
+      equationIndex++;
+      return ` $${latex}$ `; // Inline math
+    });
+
+    // Now clean up the rest of the XML
+    text = text
+      .replace(/<w:p[^>]*>/g, '\n')
+      .replace(/<w:br[^>]*>/g, '\n')
+      .replace(/<w:tab[^>]*>/g, '\t')
+      .replace(/<w:t[^>]*>([^<]*)<\/w:t>/g, '$1')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    return {
+      text,
+      hasEquations: equations.length > 0,
+      equationCount: equations.length
+    };
+  } catch (error) {
+    console.error('Error extracting OMML from DOCX:', error);
+    return { text: '', hasEquations: false };
+  }
+}
+
 async function extractTextFromPdf(file, pageStart = null, pageEnd = null) {
   try {
     // Load PDF.js from CDN
@@ -300,6 +434,166 @@ function loadScript(src) {
   });
 
   return scriptLoadPromises[src];
+}
+
+// Cache for in-flight stylesheet loading promises
+const stylesheetLoadPromises = {};
+
+function loadStylesheet(href) {
+  if (stylesheetLoadPromises[href]) {
+    return stylesheetLoadPromises[href];
+  }
+
+  stylesheetLoadPromises[href] = new Promise((resolve, reject) => {
+    const existingLink = document.querySelector(`link[href="${href}"]`);
+    if (existingLink) {
+      resolve();
+      return;
+    }
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.onload = resolve;
+    link.onerror = reject;
+    document.head.appendChild(link);
+  });
+
+  return stylesheetLoadPromises[href];
+}
+
+// Rich text library state
+let richTextLibrariesLoaded = false;
+let richTextLibrariesLoading = null;
+
+async function loadRichTextLibraries() {
+  if (richTextLibrariesLoaded) return;
+  if (richTextLibrariesLoading) return richTextLibrariesLoading;
+
+  richTextLibrariesLoading = (async () => {
+    // Load KaTeX CSS and JS
+    await Promise.all([
+      loadStylesheet('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css'),
+      loadScript('https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js'),
+    ]);
+
+    // Load marked.js for markdown
+    await loadScript('https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js');
+
+    // Load html2canvas for math-to-image export
+    await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+
+    richTextLibrariesLoaded = true;
+  })();
+
+  return richTextLibrariesLoading;
+}
+
+// Render LaTeX math to an image (returns base64 PNG data URL)
+async function latexToImage(latex, displayMode = false) {
+  await loadRichTextLibraries();
+
+  // Create a temporary container for rendering
+  const container = document.createElement('div');
+  container.style.cssText = 'position: absolute; left: -9999px; top: -9999px; background: white; padding: 8px;';
+  document.body.appendChild(container);
+
+  try {
+    // Render LaTeX with KaTeX
+    const html = window.katex.renderToString(latex, {
+      displayMode: displayMode,
+      throwOnError: false,
+      output: 'html',
+    });
+    container.innerHTML = html;
+
+    // Use html2canvas to capture as image
+    const canvas = await window.html2canvas(container, {
+      backgroundColor: null,
+      scale: 2, // Higher resolution
+      logging: false,
+    });
+
+    const dataUrl = canvas.toDataURL('image/png');
+    return dataUrl;
+  } finally {
+    document.body.removeChild(container);
+  }
+}
+
+// Process text containing math and markdown for QTI export
+// Returns { html: string, images: Array<{filename, dataUrl, altText}> }
+async function processTextForQTI(text, imageFiles, imageCounter) {
+  if (!text) return { html: '', images: [], counter: imageCounter };
+
+  const images = [];
+  let counter = imageCounter;
+  let processedText = text;
+
+  // Find and convert display math ($$...$$)
+  const displayMathRegex = /\$\$([\s\S]+?)\$\$/g;
+  let displayMatches = [...text.matchAll(displayMathRegex)];
+
+  for (const match of displayMatches) {
+    const latex = match[1].trim();
+    try {
+      const imgDataUrl = await latexToImage(latex, true);
+      counter++;
+      const filename = `math_${counter}.png`;
+      images.push({ filename, dataUrl: imgDataUrl, mimeType: 'image/png', altText: latex });
+      processedText = processedText.replace(match[0], `<p style="text-align: center;"><img src="%24IMS-CC-FILEBASE%24/${filename}" alt="${escapeXmlForQTI(latex)}" style="max-height: 100px;" /></p>`);
+    } catch (e) {
+      console.error('Failed to render display math:', e);
+      // Keep original text if rendering fails
+    }
+  }
+
+  // Find and convert inline math ($...$)
+  const inlineMathRegex = /(?<!\$)\$(?!\$)([^\$\n]+?)\$(?!\$)/g;
+  let inlineMatches = [...processedText.matchAll(inlineMathRegex)];
+
+  for (const match of inlineMatches) {
+    const latex = match[1].trim();
+    try {
+      const imgDataUrl = await latexToImage(latex, false);
+      counter++;
+      const filename = `math_${counter}.png`;
+      images.push({ filename, dataUrl: imgDataUrl, mimeType: 'image/png', altText: latex });
+      processedText = processedText.replace(match[0], `<img src="%24IMS-CC-FILEBASE%24/${filename}" alt="${escapeXmlForQTI(latex)}" style="vertical-align: middle; max-height: 1.5em;" />`);
+    } catch (e) {
+      console.error('Failed to render inline math:', e);
+    }
+  }
+
+  // Convert basic markdown (if no complex HTML needed)
+  processedText = processedText
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/\n/g, '<br />');
+
+  return { html: processedText, images, counter };
+}
+
+// Helper for XML escaping in QTI
+function escapeXmlForQTI(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Helper to check if text contains LaTeX math delimiters
+function containsMath(text) {
+  if (!text) return false;
+  return /\$\$[\s\S]+?\$\$|\$[^\$\n]+?\$/.test(text);
+}
+
+// Helper to check if text contains markdown formatting
+function containsMarkdown(text) {
+  if (!text) return false;
+  return /\*\*.+?\*\*|\*.+?\*|`.+?`|^#+\s|^\-\s|^\d+\.\s/m.test(text);
 }
 
 function getImageDimensions(dataUrl) {
@@ -2185,6 +2479,16 @@ ${q.options.find(o => o.isCorrect) ? `          <respcondition continue="No">
       }).join('');
     };
 
+    // Check if any question has math content
+    const hasMathContent = quiz.questions.some(q =>
+      containsMath(q.text) || (q.options && q.options.some(opt => containsMath(opt.text)))
+    );
+
+    // Load rich text libraries if needed for math conversion
+    if (hasMathContent) {
+      await loadRichTextLibraries();
+    }
+
     let qtiXml = `<?xml version="1.0" encoding="UTF-8"?>
 <questestinterop xmlns="http://www.imsglobal.org/xsd/ims_qtiasiv1p2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.imsglobal.org/xsd/ims_qtiasiv1p2 http://www.imsglobal.org/xsd/ims_qtiasiv1p2p1.xsd">
   <assessment ident="${assessmentId}" title="${escapeXml(quizSettings.title)}">
@@ -2197,12 +2501,37 @@ ${q.options.find(o => o.isCorrect) ? `          <respcondition continue="No">
     <section ident="root_section">
 `;
 
-    quiz.questions.forEach((q, index) => {
+    // Process questions sequentially to handle async math rendering
+    for (let index = 0; index < quiz.questions.length; index++) {
+      const q = quiz.questions[index];
       const itemIdent = `item_${q.id}`;
-      const imageHtml = processImages(q.images);
-      const questionHtml = `<p>${escapeXml(q.text)}</p>${imageHtml}`;
+      const userImageHtml = processImages(q.images);
+
+      // Process question text (convert math to images if present)
+      let questionHtml;
+      if (containsMath(q.text) || containsMarkdown(q.text)) {
+        const result = await processTextForQTI(q.text, imageFiles, imageCounter);
+        questionHtml = `<p>${result.html}</p>${userImageHtml}`;
+        imageCounter = result.counter;
+        result.images.forEach(img => imageFiles.push(img));
+      } else {
+        questionHtml = `<p>${escapeXml(q.text)}</p>${userImageHtml}`;
+      }
 
       if (q.type === 'multiple_choice' || q.type === 'true_false') {
+        // Process option texts
+        const processedOptions = [];
+        for (const opt of q.options) {
+          if (containsMath(opt.text) || containsMarkdown(opt.text)) {
+            const result = await processTextForQTI(opt.text, imageFiles, imageCounter);
+            imageCounter = result.counter;
+            result.images.forEach(img => imageFiles.push(img));
+            processedOptions.push({ ...opt, processedHtml: `<p>${result.html}</p>` });
+          } else {
+            processedOptions.push({ ...opt, processedHtml: `<p>${escapeXml(opt.text)}</p>` });
+          }
+        }
+
         qtiXml += `      <item ident="${itemIdent}" title="Question ${index + 1}">
         <itemmetadata>
           <qtimetadata>
@@ -2222,9 +2551,9 @@ ${q.options.find(o => o.isCorrect) ? `          <respcondition continue="No">
           </material>
           <response_lid ident="response1" rcardinality="Single">
             <render_choice>
-${q.options.map(opt => `              <response_label ident="${opt.id}">
+${processedOptions.map(opt => `              <response_label ident="${opt.id}">
                 <material>
-                  <mattext texttype="text/html"><![CDATA[<p>${escapeXml(opt.text)}</p>]]></mattext>
+                  <mattext texttype="text/html"><![CDATA[${opt.processedHtml}]]></mattext>
                 </material>
               </response_label>`).join('\n')}
             </render_choice>
@@ -2270,7 +2599,7 @@ ${q.options.find(o => o.isCorrect) ? `          <respcondition continue="No">
       </item>
 `;
       }
-    });
+    }
 
     qtiXml += `    </section>
   </assessment>
@@ -2327,8 +2656,8 @@ ${resourceRefs}
   };
 
   const handleStartProcessing = () => {
-    const content = textInput || extractedText || SAMPLE_QUIZ_TEXT;
-    if (!content.trim() && !uploadedFile) {
+    const content = textInput || extractedText;
+    if (!content?.trim() && !uploadedFile) {
       setError('Please enter quiz content or upload a file.');
       return;
     }
@@ -2480,7 +2809,6 @@ ${resourceRefs}
             onTextChange={setTextInput}
             onToggleTextInput={() => setShowTextInput(!showTextInput)}
             onStartProcessing={handleStartProcessing}
-            onLoadSample={() => setTextInput(SAMPLE_QUIZ_TEXT)}
           />
         )}
 
@@ -2588,7 +2916,7 @@ function UploadStep({
   uploadedFiles, textInput, showTextInput, fileInputRef, error, apiKey,
   extractedImages, extractedText, fileType, processingStatus, importedQuizzes,
   rateLimitInfo, rateLimitError,
-  onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onTextChange, onToggleTextInput, onStartProcessing, onLoadSample,
+  onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onTextChange, onToggleTextInput, onStartProcessing,
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -2774,10 +3102,6 @@ Tip: Include your answer key at the end!
 Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
               rows={12}
             />
-            <button style={styles.loadSampleButton} onClick={onLoadSample}>
-              <Lightbulb size={16} />
-              Load sample (with answer key)
-            </button>
           </div>
         )}
       </div>
@@ -3368,6 +3692,8 @@ function EditStep({
 
 function QuestionEditor({ question, questionNumber, totalQuestions, onUpdate, onDelete, onPrev, onNext, onAddImage, onRemoveImage, onPreviewImage }) {
   const imageInputRef = useRef(null);
+  const textAreaRef = useRef(null);
+  const [showPreview, setShowPreview] = useState(false);
 
   const handleOptionChange = (optionId, field, value) => {
     const newOptions = question.options.map(opt => opt.id === optionId ? { ...opt, [field]: value } : opt);
@@ -3398,6 +3724,45 @@ function QuestionEditor({ question, questionNumber, totalQuestions, onUpdate, on
     if (file && file.type.startsWith('image/')) onAddImage(file);
     e.target.value = '';
   };
+
+  // Math toolbar insertion helpers
+  const insertMath = (template, cursorOffset = 0) => {
+    const textarea = textAreaRef.current;
+    if (!textarea) return;
+
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const text = question.text;
+    const selectedText = text.substring(start, end);
+
+    let insertion;
+    if (selectedText && template.includes('{}')) {
+      insertion = template.replace('{}', selectedText);
+    } else {
+      insertion = template;
+    }
+
+    const newText = text.substring(0, start) + insertion + text.substring(end);
+    onUpdate({ text: newText });
+
+    // Set cursor position after React updates
+    setTimeout(() => {
+      textarea.focus();
+      const newPos = start + insertion.length + cursorOffset;
+      textarea.setSelectionRange(newPos, newPos);
+    }, 0);
+  };
+
+  const mathButtons = [
+    { label: 'x²', template: '^{2}', title: 'Superscript' },
+    { label: 'xₙ', template: '_{n}', title: 'Subscript' },
+    { label: '√', template: '\\sqrt{}', title: 'Square root' },
+    { label: 'a/b', template: '\\frac{a}{b}', title: 'Fraction' },
+    { label: '$', template: '$$', title: 'Inline math' },
+    { label: '$$', template: '\n$$\n\n$$\n', title: 'Display math block' },
+  ];
+
+  const hasMathOrMarkdown = containsMath(question.text) || containsMarkdown(question.text);
 
   return (
     <div style={styles.editorContainer}>
@@ -3434,8 +3799,59 @@ function QuestionEditor({ question, questionNumber, totalQuestions, onUpdate, on
       </div>
 
       <div style={styles.editorField}>
-        <label style={styles.fieldLabel}>Question Text</label>
-        <textarea style={styles.questionTextArea} value={question.text} onChange={(e) => onUpdate({ text: e.target.value })} rows={3} />
+        <div style={styles.fieldLabelRow}>
+          <label style={styles.fieldLabel}>Question Text</label>
+          <div style={styles.editPreviewToggle}>
+            <button
+              style={{...styles.toggleButton, ...(showPreview ? {} : styles.toggleButtonActive)}}
+              onClick={() => setShowPreview(false)}
+            >
+              Edit
+            </button>
+            <button
+              style={{...styles.toggleButton, ...(showPreview ? styles.toggleButtonActive : {})}}
+              onClick={() => setShowPreview(true)}
+            >
+              Preview
+            </button>
+          </div>
+        </div>
+
+        {!showPreview && (
+          <>
+            <div style={styles.mathToolbar}>
+              {mathButtons.map((btn, i) => (
+                <button
+                  key={i}
+                  style={styles.mathToolbarButton}
+                  onClick={() => insertMath(btn.template)}
+                  title={btn.title}
+                >
+                  {btn.label}
+                </button>
+              ))}
+              <span style={styles.mathToolbarHint}>Use $...$ for inline math, $$...$$ for display math</span>
+            </div>
+            <textarea
+              ref={textAreaRef}
+              style={styles.questionTextArea}
+              value={question.text}
+              onChange={(e) => onUpdate({ text: e.target.value })}
+              rows={3}
+              placeholder="Enter question text. Use $..$ for math like $x^2 + y^2 = z^2$"
+            />
+          </>
+        )}
+
+        {showPreview && (
+          <div style={styles.questionPreviewBox}>
+            {hasMathOrMarkdown ? (
+              <RichTextRenderer text={question.text} />
+            ) : (
+              <p style={styles.questionPreviewText}>{question.text}</p>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={styles.editorField}>
@@ -3830,6 +4246,9 @@ function ToggleOption({ label, checked, onChange }) {
 
 function PreviewStep({ quiz, settings, onBack, onNext }) {
   const [currentQ, setCurrentQ] = useState(0);
+  const currentQuestion = quiz.questions[currentQ];
+  const hasRichText = containsMath(currentQuestion.text) || containsMarkdown(currentQuestion.text);
+
   return (
     <div style={styles.previewStep}>
       <div style={styles.previewHeader}>
@@ -3841,27 +4260,38 @@ function PreviewStep({ quiz, settings, onBack, onNext }) {
       <div style={styles.previewCard}>
         <div style={styles.previewCardHeader}>
           <span style={styles.previewQuestionNumber}>Question {currentQ + 1} of {quiz.questions.length}</span>
-          <span style={styles.previewPoints}>{quiz.questions[currentQ].points} pts</span>
+          <span style={styles.previewPoints}>{currentQuestion.points} pts</span>
         </div>
-        <p style={styles.previewQuestionText}>{quiz.questions[currentQ].text}</p>
-        {quiz.questions[currentQ].images?.length > 0 && (
+        <div style={styles.previewQuestionText}>
+          {hasRichText ? (
+            <RichTextRenderer text={currentQuestion.text} />
+          ) : (
+            currentQuestion.text
+          )}
+        </div>
+        {currentQuestion.images?.length > 0 && (
           <div style={styles.previewImagesContainer}>
-            {quiz.questions[currentQ].images.map((img, i) => (
+            {currentQuestion.images.map((img, i) => (
               <img key={img.id} src={img.dataUrl} alt={`Q${currentQ + 1} img ${i + 1}`} style={styles.previewQuestionImage} />
             ))}
           </div>
         )}
-        {['multiple_choice', 'multiple_select', 'true_false'].includes(quiz.questions[currentQ].type) && (
+        {['multiple_choice', 'multiple_select', 'true_false'].includes(currentQuestion.type) && (
           <div style={styles.previewOptions}>
-            {quiz.questions[currentQ].options.map(opt => (
-              <div key={opt.id} style={{ ...styles.previewOption, ...(opt.isCorrect && styles.previewOptionCorrect) }}>
-                <div style={{ ...styles.previewOptionCircle, ...(opt.isCorrect && styles.previewOptionCircleCorrect) }}>
-                  {opt.isCorrect && <Check size={12} color="#fff" />}
+            {currentQuestion.options.map(opt => {
+              const optHasRichText = containsMath(opt.text) || containsMarkdown(opt.text);
+              return (
+                <div key={opt.id} style={{ ...styles.previewOption, ...(opt.isCorrect && styles.previewOptionCorrect) }}>
+                  <div style={{ ...styles.previewOptionCircle, ...(opt.isCorrect && styles.previewOptionCircleCorrect) }}>
+                    {opt.isCorrect && <Check size={12} color="#fff" />}
+                  </div>
+                  <span style={styles.previewOptionText}>
+                    {optHasRichText ? <RichTextRenderer text={opt.text} inline /> : opt.text}
+                  </span>
+                  {opt.isCorrect && <span style={styles.correctBadge}>Correct</span>}
                 </div>
-                <span>{opt.text}</span>
-                {opt.isCorrect && <span style={styles.correctBadge}>✓ Correct</span>}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -3955,6 +4385,125 @@ function ImagePreviewModal({ image, onClose }) {
         <img src={image.dataUrl} alt={image.filename || 'Preview'} style={styles.fullImagePreview} />
       </div>
     </div>
+  );
+}
+
+// ============================================================================
+// RICH TEXT RENDERER - Markdown + LaTeX Math
+// ============================================================================
+
+function RichTextRenderer({ text, inline = false }) {
+  const [renderedContent, setRenderedContent] = useState(text);
+  const [isReady, setIsReady] = useState(false);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function renderContent() {
+      if (!text) {
+        setRenderedContent('');
+        setIsReady(true);
+        return;
+      }
+
+      try {
+        await loadRichTextLibraries();
+
+        if (!mounted) return;
+
+        // Step 1: Extract and protect math blocks
+        const mathBlocks = [];
+        let processedText = text;
+
+        // Extract display math ($$...$$)
+        processedText = processedText.replace(/\$\$([\s\S]+?)\$\$/g, (match, math) => {
+          const id = `__MATH_DISPLAY_${mathBlocks.length}__`;
+          mathBlocks.push({ id, math: math.trim(), display: true });
+          return id;
+        });
+
+        // Extract inline math ($...$) - be careful not to match $$ or currency
+        processedText = processedText.replace(/(?<!\$)\$(?!\$)([^\$\n]+?)\$(?!\$)/g, (match, math) => {
+          const id = `__MATH_INLINE_${mathBlocks.length}__`;
+          mathBlocks.push({ id, math: math.trim(), display: false });
+          return id;
+        });
+
+        // Step 2: Process markdown (if marked is available)
+        if (window.marked) {
+          // Configure marked for safe output
+          window.marked.setOptions({
+            gfm: true,
+            breaks: true,
+          });
+          processedText = window.marked.parse(processedText);
+        } else {
+          // Basic markdown fallback
+          processedText = processedText
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*(.+?)\*/g, '<em>$1</em>')
+            .replace(/`(.+?)`/g, '<code>$1</code>')
+            .replace(/\n/g, '<br />');
+        }
+
+        // Step 3: Render math and replace placeholders
+        for (const block of mathBlocks) {
+          try {
+            const rendered = window.katex.renderToString(block.math, {
+              displayMode: block.display,
+              throwOnError: false,
+              output: 'html',
+            });
+            processedText = processedText.replace(block.id, rendered);
+          } catch (e) {
+            // If KaTeX fails, show the original math with error styling
+            const errorHtml = `<span style="color: #ef4444; background: #fef2f2; padding: 2px 4px; border-radius: 4px; font-family: monospace;">${block.display ? '$$' : '$'}${block.math}${block.display ? '$$' : '$'}</span>`;
+            processedText = processedText.replace(block.id, errorHtml);
+          }
+        }
+
+        if (mounted) {
+          setRenderedContent(processedText);
+          setIsReady(true);
+        }
+      } catch (error) {
+        console.error('Error rendering rich text:', error);
+        if (mounted) {
+          // Fallback to plain text with basic escaping
+          setRenderedContent(text.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+          setIsReady(true);
+        }
+      }
+    }
+
+    renderContent();
+
+    return () => {
+      mounted = false;
+    };
+  }, [text]);
+
+  if (!isReady) {
+    return <span style={styles.richTextLoading}>Loading...</span>;
+  }
+
+  if (inline) {
+    return (
+      <span
+        ref={containerRef}
+        style={styles.richTextInline}
+        dangerouslySetInnerHTML={{ __html: renderedContent }}
+      />
+    );
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      style={styles.richTextBlock}
+      dangerouslySetInnerHTML={{ __html: renderedContent }}
+    />
   );
 }
 
@@ -4294,6 +4843,23 @@ const styles = {
   selectField: { display: 'flex', flexDirection: 'column', gap: '8px' },
   selectLabel: { fontSize: '13px', fontWeight: '500', color: '#64748b' },
   selectInput: { padding: '10px 14px', border: '1px solid #e5e7eb', borderRadius: '8px', fontSize: '14px', color: '#374151', backgroundColor: '#fff', cursor: 'pointer' },
+
+  // Math Toolbar & Rich Text Styles
+  fieldLabelRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' },
+  editPreviewToggle: { display: 'flex', gap: '4px', backgroundColor: '#f1f5f9', borderRadius: '6px', padding: '2px' },
+  toggleButton: { padding: '6px 12px', border: 'none', borderRadius: '4px', backgroundColor: 'transparent', color: '#64748b', fontSize: '12px', fontWeight: '500', cursor: 'pointer' },
+  toggleButtonActive: { backgroundColor: '#fff', color: '#3b82f6', boxShadow: '0 1px 2px rgba(0,0,0,0.1)' },
+  mathToolbar: { display: 'flex', alignItems: 'center', gap: '4px', padding: '8px 12px', backgroundColor: '#f8fafc', borderRadius: '8px 8px 0 0', border: '1px solid #e5e7eb', borderBottom: 'none', flexWrap: 'wrap' },
+  mathToolbarButton: { padding: '6px 10px', border: '1px solid #e5e7eb', borderRadius: '4px', backgroundColor: '#fff', color: '#374151', fontSize: '13px', fontWeight: '500', cursor: 'pointer', fontFamily: 'serif' },
+  mathToolbarHint: { marginLeft: 'auto', fontSize: '11px', color: '#9ca3af', fontStyle: 'italic' },
+  questionPreviewBox: { padding: '16px', backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', minHeight: '100px', fontSize: '15px', lineHeight: 1.6, color: '#1e293b' },
+  questionPreviewText: { margin: 0, whiteSpace: 'pre-wrap' },
+
+  // Rich Text Renderer Styles
+  richTextLoading: { color: '#9ca3af', fontStyle: 'italic', fontSize: '13px' },
+  richTextInline: { display: 'inline' },
+  richTextBlock: { lineHeight: 1.6 },
+  previewOptionText: { flex: 1 },
 };
 
 // CSS animations
