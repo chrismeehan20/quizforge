@@ -5,6 +5,45 @@ import { Upload, FileText, Wand2, Eye, Download, ChevronRight, ChevronLeft, Chec
 // QUIZFORGE V3 - With PDF Support & Answer Key Assistant
 // ============================================================================
 
+// Generate a browser fingerprint for rate limiting
+function generateClientId() {
+  if (typeof window === 'undefined') return 'server';
+
+  const stored = localStorage.getItem('quizforge_client_id');
+  if (stored) return stored;
+
+  // Create fingerprint from browser characteristics
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.textBaseline = 'top';
+    ctx.font = '14px Arial';
+    ctx.fillText('QuizForge', 2, 2);
+  }
+  const canvasHash = canvas.toDataURL().slice(-50);
+
+  const components = [
+    navigator.userAgent,
+    navigator.language,
+    screen.width + 'x' + screen.height,
+    new Date().getTimezoneOffset(),
+    canvasHash
+  ].join('|');
+
+  // Simple hash
+  let hash = 0;
+  for (let i = 0; i < components.length; i++) {
+    hash = ((hash << 5) - hash) + components.charCodeAt(i);
+    hash = hash & hash;
+  }
+  const clientId = 'qf_' + Math.abs(hash).toString(36);
+
+  localStorage.setItem('quizforge_client_id', clientId);
+  return clientId;
+}
+
+const CLIENT_ID = generateClientId();
+
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 const QUESTION_TYPES = {
@@ -1013,10 +1052,11 @@ export default function QuizForge() {
   const [importedQuizzes, setImportedQuizzes] = useState([]); // Pre-parsed LMS quizzes
   const [textInput, setTextInput] = useState('');
   const [showTextInput, setShowTextInput] = useState(false);
-  const [apiKey, setApiKey] = useState('');
-  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [apiKey] = useState('embedded'); // Using embedded API key with rate limiting
   const [showAnswerKeyModal, setShowAnswerKeyModal] = useState(false);
   const [error, setError] = useState(null);
+  const [rateLimitInfo, setRateLimitInfo] = useState({ limit: 10, remaining: 10 });
+  const [rateLimitError, setRateLimitError] = useState(null);
   const [exportFormat, setExportFormat] = useState('qti');
   const [extractedImages, setExtractedImages] = useState([]);
   const [extractedText, setExtractedText] = useState('');
@@ -1052,6 +1092,36 @@ export default function QuizForge() {
   const [pageRange, setPageRange] = useState({ start: '', end: '' });
 
   const fileInputRef = useRef(null);
+
+  // API proxy that uses embedded key with rate limiting
+  const callAnthropicProxy = async (body) => {
+    const response = await fetch('/api/anthropic', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Client-ID': CLIENT_ID,
+      },
+      body: JSON.stringify(body)
+    });
+
+    // Update rate limit info from headers
+    const limit = parseInt(response.headers.get('X-RateLimit-Limit') || '10');
+    const remaining = parseInt(response.headers.get('X-RateLimit-Remaining') || '0');
+    setRateLimitInfo({ limit, remaining });
+
+    if (response.status === 429) {
+      const errorData = await response.json();
+      setRateLimitError(errorData.error?.message || 'Daily limit reached. Please try again tomorrow.');
+      throw new Error(errorData.error?.message || 'Rate limit exceeded');
+    }
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error?.message || 'API request failed');
+    }
+
+    return response.json();
+  };
 
   const steps = [
     { id: 0, label: 'Upload', icon: Upload },
@@ -1329,27 +1399,20 @@ export default function QuizForge() {
       if (apiKey) {
         setProcessingStatus('Connecting to AI...');
         setProcessingProgress(15);
-        
+        setRateLimitError(null);
+
         let imageContext = '';
         if (extractedImages.length > 0) {
           imageContext = `\n\nNOTE: This document contains ${extractedImages.length} embedded images. They are referenced as [IMAGE_1], [IMAGE_2], etc. When you detect that a question references an image, include an "imageRefs" array with the image numbers.`;
         }
-        
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true',
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 8000,
-            messages: [
-              {
-                role: 'user',
-                content: `You are a quiz parsing assistant. Parse the following quiz content and extract structured data.
+
+        const data = await callAnthropicProxy({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 8000,
+          messages: [
+            {
+              role: 'user',
+              content: `You are a quiz parsing assistant. Parse the following quiz content and extract structured data.
 
 IMPORTANT: Look for an answer key in the document. It might be at the end, labeled "Answer Key", "Answers", or just a list like "1-B, 2-A, 3-C". If you find answers, mark the correct options.
 
@@ -1391,17 +1454,12 @@ QUIZ CONTENT:
 ---
 ${content}
 ---`
-              }
-            ]
-          })
+            }
+          ]
         });
 
         setProcessingProgress(70);
         setProcessingStatus('Processing AI response...');
-
-        if (!response.ok) throw new Error('API request failed');
-
-        const data = await response.json();
         const aiResponse = data.content[0].text;
         
         let parsedQuiz;
@@ -1805,8 +1863,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text before or after.`;
   };
 
   const handleGenerateQuiz = async () => {
-    if (!apiKey) {
-      setError('An API key is required to generate quizzes. Click "Connect AI" to add your key.');
+    if (rateLimitInfo.remaining <= 0) {
+      setError('Daily limit reached. Please try again tomorrow.');
       return;
     }
 
@@ -1851,33 +1909,19 @@ IMPORTANT: Return ONLY the JSON object, no additional text before or after.`;
 
       setProcessingProgress(20);
       setProcessingStatus(`Generating ${totalQuestions} questions with AI...`);
+      setRateLimitError(null);
 
       const prompt = buildGenerationPrompt(sourceText, generationConfig);
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 8000,
-          messages: [{ role: 'user', content: prompt }],
-        }),
+      const result = await callAnthropicProxy({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8000,
+        messages: [{ role: 'user', content: prompt }],
       });
 
       setProcessingProgress(70);
       setProcessingStatus('Processing AI response...');
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || `API request failed with status ${response.status}`);
-      }
-
-      const result = await response.json();
       const generatedContent = result.content?.[0]?.text;
 
       if (!generatedContent) {
@@ -2349,10 +2393,10 @@ ${resourceRefs}
           )}
           
           <div style={styles.headerActions}>
-            <button style={styles.apiKeyButton} onClick={() => setShowApiKeyModal(true)}>
+            <div style={styles.usageIndicator}>
               <Sparkles size={16} />
-              {apiKey ? 'AI Connected' : 'Connect AI'}
-            </button>
+              <span>AI: {rateLimitInfo.remaining}/{rateLimitInfo.limit} uses today</span>
+            </div>
             {currentStep > 0 && (
               <button style={styles.resetButton} onClick={handleReset}>
                 <RotateCcw size={16} />
@@ -2405,6 +2449,8 @@ ${resourceRefs}
             fileType={fileType}
             processingStatus={processingStatus}
             importedQuizzes={importedQuizzes}
+            rateLimitInfo={rateLimitInfo}
+            rateLimitError={rateLimitError}
             onDrop={handleDrop}
             onFilesSelect={handleFilesSelect}
             onRemoveFile={removeFile}
@@ -2428,6 +2474,8 @@ ${resourceRefs}
             importedQuizzes={importedQuizzes}
             generationConfig={generationConfig}
             pageRange={pageRange}
+            rateLimitInfo={rateLimitInfo}
+            rateLimitError={rateLimitError}
             onDrop={handleDrop}
             onFilesSelect={handleFilesSelect}
             onRemoveFile={removeFile}
@@ -2493,16 +2541,13 @@ ${resourceRefs}
         )}
       </main>
 
-      {showApiKeyModal && (
-        <ApiKeyModal apiKey={apiKey} onSave={setApiKey} onClose={() => setShowApiKeyModal(false)} />
-      )}
-      
       {showAnswerKeyModal && quiz && (
         <AnswerKeyModal
           quiz={quiz}
           onApply={handleApplyAnswerKey}
           onClose={() => setShowAnswerKeyModal(false)}
           apiKey={apiKey}
+          callAnthropicProxy={callAnthropicProxy}
         />
       )}
       
@@ -2520,6 +2565,7 @@ ${resourceRefs}
 function UploadStep({
   uploadedFiles, textInput, showTextInput, fileInputRef, error, apiKey,
   extractedImages, extractedText, fileType, processingStatus, importedQuizzes,
+  rateLimitInfo, rateLimitError,
   onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onTextChange, onToggleTextInput, onStartProcessing, onLoadSample,
 }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -2546,6 +2592,19 @@ function UploadStep({
         <div style={error.startsWith('Warning') ? styles.warningBanner : styles.errorBanner}>
           <AlertTriangle size={18} />
           <span>{error}</span>
+        </div>
+      )}
+
+      {rateLimitError && (
+        <div style={styles.rateLimitBanner}>
+          <AlertTriangle size={18} />
+          <span>{rateLimitError}</span>
+        </div>
+      )}
+
+      {rateLimitInfo && rateLimitInfo.remaining <= 3 && !rateLimitError && (
+        <div style={styles.rateLimitWarning}>
+          <span>{rateLimitInfo.remaining} of {rateLimitInfo.limit} daily uses remaining</span>
         </div>
       )}
 
@@ -2746,7 +2805,7 @@ Example: "Answer Key: 1-B, 2-A, 3-C" or just "B, A, C, D, A"`}
 
 function GenerateUploadStep({
   uploadedFiles, fileInputRef, error, apiKey, extractedText, fileType, processingStatus, importedQuizzes,
-  generationConfig, pageRange,
+  generationConfig, pageRange, rateLimitInfo, rateLimitError,
   onDrop, onFilesSelect, onRemoveFile, onClearAllFiles, onConfigChange, onPageRangeChange, onGenerate
 }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -2802,6 +2861,19 @@ function GenerateUploadStep({
         <div style={error.startsWith('Warning') ? styles.warningBanner : styles.errorBanner}>
           <AlertTriangle size={18} />
           <span>{error}</span>
+        </div>
+      )}
+
+      {rateLimitError && (
+        <div style={styles.rateLimitBanner}>
+          <AlertTriangle size={18} />
+          <span>{rateLimitError}</span>
+        </div>
+      )}
+
+      {rateLimitInfo && rateLimitInfo.remaining <= 3 && !rateLimitError && (
+        <div style={styles.rateLimitWarning}>
+          <span>{rateLimitInfo.remaining} of {rateLimitInfo.limit} daily uses remaining</span>
         </div>
       )}
 
@@ -3070,12 +3142,6 @@ function GenerateUploadStep({
           <span>Generate {totalQuestions} Questions</span>
           <ChevronRight size={20} />
         </button>
-        {!apiKey && (
-          <p style={styles.demoNote}>
-            <AlertTriangle size={14} />
-            An API key is required to generate quizzes. Click "Connect AI" above.
-          </p>
-        )}
         {totalQuestions === 0 && (
           <p style={styles.demoNote}>
             <AlertTriangle size={14} />
@@ -3412,7 +3478,7 @@ function QuestionEditor({ question, questionNumber, totalQuestions, onUpdate, on
 // ANSWER KEY MODAL
 // ============================================================================
 
-function AnswerKeyModal({ quiz, onApply, onClose, apiKey }) {
+function AnswerKeyModal({ quiz, onApply, onClose, apiKey, callAnthropicProxy }) {
   const [mode, setMode] = useState('paste'); // 'paste', 'quick', 'ai'
   const [pasteInput, setPasteInput] = useState('');
   const [quickAnswers, setQuickAnswers] = useState({});
@@ -3459,9 +3525,9 @@ function AnswerKeyModal({ quiz, onApply, onClose, apiKey }) {
   };
 
   const generateAISuggestions = async () => {
-    if (!apiKey) return;
+    if (!apiKey || !callAnthropicProxy) return;
     setIsGenerating(true);
-    
+
     try {
       const questionsText = questionsNeedingAnswers.map((q, i) => {
         const originalIndex = quiz.questions.findIndex(oq => oq.id === q.id);
@@ -3472,20 +3538,12 @@ function AnswerKeyModal({ quiz, onApply, onClose, apiKey }) {
         return text;
       }).join('\n\n');
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2000,
-          messages: [{
-            role: 'user',
-            content: `You are helping a teacher create an answer key. For each question below, provide the most likely correct answer.
+      const data = await callAnthropicProxy({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{
+          role: 'user',
+          content: `You are helping a teacher create an answer key. For each question below, provide the most likely correct answer.
 
 IMPORTANT: Only output the answers in this exact format, one per line:
 1-B
@@ -3497,20 +3555,16 @@ Do not include explanations. Just the question number, a dash, and the answer le
 
 Questions:
 ${questionsText}`
-          }]
-        })
+        }]
       });
 
-      if (response.ok) {
-        const data = await response.json();
-        const aiAnswers = data.content[0].text;
-        setPasteInput(aiAnswers);
-        setMode('paste');
-      }
+      const aiAnswers = data.content[0].text;
+      setPasteInput(aiAnswers);
+      setMode('paste');
     } catch (err) {
       console.error('AI generation error:', err);
     }
-    
+
     setIsGenerating(false);
   };
 
@@ -3903,6 +3957,7 @@ const styles = {
   stepConnector: { width: '20px', height: '2px', borderRadius: '1px' },
   headerActions: { display: 'flex', alignItems: 'center', gap: '12px' },
   apiKeyButton: { display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px', border: '1px solid #e5e7eb', borderRadius: '8px', backgroundColor: '#fff', color: '#374151', fontSize: '13px', fontWeight: '500', cursor: 'pointer' },
+  usageIndicator: { display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px', border: '1px solid #d1fae5', borderRadius: '8px', backgroundColor: '#ecfdf5', color: '#047857', fontSize: '13px', fontWeight: '500' },
   resetButton: { display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px', border: 'none', borderRadius: '8px', backgroundColor: '#fef2f2', color: '#dc2626', fontSize: '13px', fontWeight: '500', cursor: 'pointer' },
   main: { maxWidth: '1400px', margin: '0 auto', padding: '24px' },
 
@@ -3913,6 +3968,8 @@ const styles = {
   heroSubtitle: { fontSize: '16px', color: '#64748b', lineHeight: 1.6 },
   errorBanner: { display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 16px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '10px', color: '#dc2626', marginBottom: '24px', fontSize: '14px' },
   warningBanner: { display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 16px', backgroundColor: '#fffbeb', border: '1px solid #fde68a', borderRadius: '10px', color: '#92400e', marginBottom: '24px', fontSize: '14px' },
+  rateLimitBanner: { display: 'flex', alignItems: 'center', gap: '10px', padding: '16px 20px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: '12px', color: '#dc2626', fontSize: '14px', marginBottom: '20px' },
+  rateLimitWarning: { display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px 16px', backgroundColor: '#fffbeb', borderRadius: '8px', color: '#92400e', fontSize: '13px', marginBottom: '16px' },
   uploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px' },
   dropZone: { border: '2px dashed #d1d5db', borderRadius: '16px', padding: '48px 24px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.3s ease', backgroundColor: '#fff' },
   dropZoneDragging: { borderColor: '#3b82f6', backgroundColor: '#eff6ff' },
